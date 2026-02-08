@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+"""Import SPAN panel and circuit data into NetBox."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+# Defer heavy imports until after argparse to allow --help without dependencies
+if TYPE_CHECKING:
+    import paho.mqtt.client as mqtt
+    import pynetbox
+
+# Add lib directory to path for imports (resolve symlinks)
+script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+
+
+# Custom field definitions for NetBox
+POWER_PANEL_CUSTOM_FIELDS = {
+    "serial_number": {
+        "type": "text",
+        "label": "Serial Number",
+        "description": "Device serial number",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "vendor_name": {
+        "type": "text",
+        "label": "Vendor Name",
+        "description": "Equipment vendor/manufacturer",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "hardware_version": {
+        "type": "text",
+        "label": "Hardware Version",
+        "description": "Hardware revision identifier",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "main_breaker_rating": {
+        "type": "integer",
+        "label": "Main Breaker Rating",
+        "description": "Main breaker rating in amps",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "upstream_panel": {
+        "type": "object",
+        "object_type": "dcim.powerpanel",
+        "label": "Upstream Panel",
+        "description": "Power panel feeding this panel",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "downstream_panel": {
+        "type": "object",
+        "object_type": "dcim.powerpanel",
+        "label": "Downstream Panel",
+        "description": "Power panel fed by this panel",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "upstream_source": {
+        "type": "text",
+        "label": "Upstream Source",
+        "description": "Description of upstream power source",
+        "content_types": ["dcim.powerpanel"],
+    },
+    "associated_device": {
+        "type": "object",
+        "object_type": "dcim.device",
+        "label": "Associated Device",
+        "description": "Device object for smart panel controller",
+        "content_types": ["dcim.powerpanel"],
+    },
+}
+
+POWER_FEED_CUSTOM_FIELDS = {
+    "panel_circuit_id": {
+        "type": "text",
+        "label": "Panel Circuit ID",
+        "description": "Circuit identifier from panel (e.g., 1a, 2b)",
+        "content_types": ["dcim.powerfeed"],
+    },
+    "panel_space": {
+        "type": "integer",
+        "label": "Panel Space",
+        "description": "Physical space number in panel",
+        "content_types": ["dcim.powerfeed"],
+    },
+    "is_duplex": {
+        "type": "boolean",
+        "label": "Is Duplex",
+        "description": "Whether this is a duplex (double-pole) circuit",
+        "content_types": ["dcim.powerfeed"],
+    },
+}
+
+
+@dataclass
+class CircuitData:
+    """Data for a circuit from MQTT."""
+
+    circuit_id: str
+    name: str = ""
+    breaker_rating: int = 0
+    space: int = 0
+    is_duplex: bool = False
+
+
+@dataclass
+class PanelData:
+    """Data for a panel from MQTT."""
+
+    serial_number: str
+    hostname: str
+    vendor_name: str = "SPAN"
+    hardware_version: str = ""
+    main_breaker_rating: int = 0
+    circuits: dict[str, CircuitData] = field(default_factory=dict)
+    # Device info from mDNS (populated when --create-devices is used)
+    model: str = ""
+    firmware_version: str = ""
+    eth0_mac: str = ""
+    eth1_mac: str = ""
+    wlan0_mac: str = ""
+    wlan0_ap_mac: str = ""
+    ip_addresses: list[str] = field(default_factory=list)
+
+
+class SpanMqttCollector:
+    """Collects panel and circuit data via MQTT."""
+
+    def __init__(
+        self,
+        serial_number: str,
+        hostname: str,
+        password: str,
+        ca_cert_path: Path,
+        timeout: float = 10.0,
+        verbose: bool = False,
+    ):
+        self.serial_number = serial_number
+        self.hostname = hostname
+        self.password = password
+        self.ca_cert_path = ca_cert_path
+        self.timeout = timeout
+        self.verbose = verbose
+
+        self.panel_data = PanelData(serial_number=serial_number, hostname=hostname)
+        self.topic_prefix = f"ebus/5/{serial_number}"
+        self._connected = False
+        self._data_received = False
+
+    def _log(self, msg: str) -> None:
+        """Log message if verbose."""
+        if self.verbose:
+            print(f"  [MQTT] {msg}", file=sys.stderr)
+
+    def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, rc: int, properties: Any = None) -> None:
+        """Handle MQTT connection."""
+        if rc == 0:
+            self._connected = True
+            self._log(f"Connected to {self.hostname}")
+
+            # Subscribe to panel topics
+            topics = [
+                f"{self.topic_prefix}/core/hardware-version",
+                f"{self.topic_prefix}/core/breaker-rating",
+                f"{self.topic_prefix}/+/name",
+                f"{self.topic_prefix}/+/breaker-rating",
+                f"{self.topic_prefix}/+/space",
+                f"{self.topic_prefix}/+/dipole",
+            ]
+            for topic in topics:
+                client.subscribe(topic)
+                self._log(f"Subscribed to {topic}")
+        else:
+            print(f"  Connection failed with code {rc}", file=sys.stderr)
+
+    def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
+        """Handle MQTT message."""
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8", errors="replace")
+
+        self._log(f"Received: {topic} = {payload[:50]}...")
+        self._data_received = True
+
+        # Parse topic to extract component
+        parts = topic.replace(f"{self.topic_prefix}/", "").split("/")
+
+        if len(parts) == 2:
+            component, prop = parts
+
+            if component == "core":
+                if prop == "hardware-version":
+                    self.panel_data.hardware_version = payload
+                elif prop == "breaker-rating":
+                    try:
+                        self.panel_data.main_breaker_rating = int(payload)
+                    except ValueError:
+                        pass
+            else:
+                # Circuit data
+                circuit_id = component
+                if circuit_id not in self.panel_data.circuits:
+                    self.panel_data.circuits[circuit_id] = CircuitData(circuit_id=circuit_id)
+
+                circuit = self.panel_data.circuits[circuit_id]
+                if prop == "name":
+                    circuit.name = payload
+                elif prop == "breaker-rating":
+                    try:
+                        circuit.breaker_rating = int(payload)
+                    except ValueError:
+                        pass
+                elif prop == "space":
+                    try:
+                        circuit.space = int(payload)
+                    except ValueError:
+                        pass
+                elif prop == "dipole":
+                    circuit.is_duplex = payload.lower() in ("true", "1", "yes")
+
+    def collect(self) -> PanelData:
+        """Connect to MQTT and collect panel/circuit data."""
+        client = mqtt.Client(
+            client_id=f"span-netbox-importer-{self.serial_number}",
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        )
+
+        client.username_pw_set(self.serial_number, self.password)
+        client.on_connect = self._on_connect
+        client.on_message = self._on_message
+
+        # Configure TLS
+        client.tls_set(
+            ca_certs=str(self.ca_cert_path),
+            cert_reqs=ssl.CERT_REQUIRED,
+            tls_version=ssl.PROTOCOL_TLS,
+        )
+
+        try:
+            self._log(f"Connecting to {self.hostname}:8883...")
+            client.connect(self.hostname, port=8883, keepalive=60)
+            client.loop_start()
+
+            # Wait for data
+            start_time = time.time()
+            while time.time() - start_time < self.timeout:
+                if self._data_received:
+                    # Give a bit more time for all messages
+                    time.sleep(2)
+                    break
+                time.sleep(0.1)
+
+            client.loop_stop()
+            client.disconnect()
+
+        except Exception as e:
+            print(f"  Error connecting to MQTT: {e}", file=sys.stderr)
+
+        return self.panel_data
+
+
+def query_device_info_mdns(serial_number: str, timeout: float = 3.0) -> dict:
+    """
+    Query mDNS _device-info service to get MAC addresses and other device info.
+
+    Returns dict with: model, firmware_version, hardware_version, eth0_mac, wlan0_mac,
+                       wlan0_ap_mac, addresses
+    """
+    from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+
+    result = {
+        "model": "",
+        "firmware_version": "",
+        "hardware_version": "",
+        "eth0_mac": "",
+        "eth1_mac": "",
+        "wlan0_mac": "",
+        "wlan0_ap_mac": "",
+        "addresses": [],
+    }
+
+    class DeviceInfoListener(ServiceListener):
+        def __init__(self):
+            self.found = False
+
+        def _process_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            """Process a service and extract device info."""
+            if serial_number.lower() not in name.lower():
+                return
+
+            info = zc.get_service_info(type_, name)
+            if not info:
+                return
+
+            result["addresses"] = list(info.parsed_addresses())
+            if info.properties:
+                props = {
+                    k.decode() if isinstance(k, bytes) else k:
+                    v.decode() if isinstance(v, bytes) else v
+                    for k, v in info.properties.items()
+                }
+                result["model"] = props.get("model", "")
+                result["firmware_version"] = props.get("firmware_version", "")
+                result["hardware_version"] = props.get("hardware_version", "")
+                result["eth0_mac"] = props.get("eth0_mac", "")
+                # eth1_mac is "unknown" when not present/used
+                eth1 = props.get("eth1_mac", "")
+                result["eth1_mac"] = "" if eth1.lower() == "unknown" else eth1
+                result["wlan0_mac"] = props.get("wlan0_mac", "")
+                result["wlan0_ap_mac"] = props.get("wlan0_ap_mac", "")
+
+                # Only mark as found when we have eth0_mac (indicates full data)
+                if result["eth0_mac"]:
+                    self.found = True
+
+        def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            self._process_service(zc, type_, name)
+
+        def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+        def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            # Re-process on update in case properties weren't available initially
+            self._process_service(zc, type_, name)
+
+    zeroconf = Zeroconf()
+    listener = DeviceInfoListener()
+    browser = ServiceBrowser(zeroconf, "_device-info._tcp.local.", listener)
+
+    try:
+        start = time.time()
+        while time.time() - start < timeout and not listener.found:
+            time.sleep(0.1)
+    finally:
+        browser.cancel()
+        zeroconf.close()
+
+    return result
+
+
+def ensure_manufacturer(nb, name: str = "SPAN", dry_run: bool = False, verbose: bool = False):
+    """Ensure manufacturer exists, create if needed."""
+    existing = nb.dcim.manufacturers.get(name=name)
+    if existing:
+        if verbose:
+            print(f"  Manufacturer '{name}' already exists", file=sys.stderr)
+        return existing
+
+    if dry_run:
+        print(f"  Would create manufacturer: {name}")
+        return None
+
+    if verbose:
+        print(f"  Creating manufacturer: {name}", file=sys.stderr)
+
+    slug = name.lower().replace(" ", "-").replace(".", "")
+    return nb.dcim.manufacturers.create(name=name, slug=slug)
+
+
+def ensure_device_type(nb, manufacturer, model: str = "SPAN Panel", dry_run: bool = False, verbose: bool = False):
+    """Ensure device type exists, create if needed."""
+    if not manufacturer:
+        return None
+
+    existing = nb.dcim.device_types.get(model=model, manufacturer_id=manufacturer.id)
+    if existing:
+        if verbose:
+            print(f"  Device type '{model}' already exists", file=sys.stderr)
+        return existing
+
+    if dry_run:
+        print(f"  Would create device type: {model}")
+        return None
+
+    if verbose:
+        print(f"  Creating device type: {model}", file=sys.stderr)
+
+    slug = model.lower().replace(" ", "-")
+    return nb.dcim.device_types.create(
+        manufacturer=manufacturer.id,
+        model=model,
+        slug=slug,
+    )
+
+
+def ensure_device_role(nb, name: str = "Smart Panel", dry_run: bool = False, verbose: bool = False):
+    """Ensure device role exists, create if needed."""
+    existing = nb.dcim.device_roles.get(name=name)
+    if existing:
+        if verbose:
+            print(f"  Device role '{name}' already exists", file=sys.stderr)
+        return existing
+
+    if dry_run:
+        print(f"  Would create device role: {name}")
+        return None
+
+    if verbose:
+        print(f"  Creating device role: {name}", file=sys.stderr)
+
+    slug = name.lower().replace(" ", "-")
+    return nb.dcim.device_roles.create(name=name, slug=slug, color="4caf50")
+
+
+def ensure_mac_address(
+    nb,
+    interface,
+    mac_address: str,
+    dry_run: bool = False,
+    verbose: bool = False,
+):
+    """Ensure a MAC address is assigned to an interface.
+
+    NetBox uses a separate mac_addresses model where MACs are first-class objects
+    that get assigned to interfaces.
+    """
+    if not mac_address or not interface:
+        return None
+
+    # Normalize MAC format for comparison
+    mac_upper = mac_address.upper().replace("-", ":")
+
+    # Check if MAC already exists on this interface
+    existing_macs = interface.mac_addresses or []
+    for existing in existing_macs:
+        if isinstance(existing, str):
+            if existing.upper() == mac_upper:
+                return None  # Already assigned
+        elif hasattr(existing, 'mac_address'):
+            if existing.mac_address.upper() == mac_upper:
+                return None  # Already assigned
+
+    if dry_run:
+        print(f"    Would assign MAC {mac_address} to {interface.name}")
+        return None
+
+    # Check if MAC exists elsewhere (might need to reassign)
+    existing_mac = nb.dcim.mac_addresses.get(mac_address=mac_address)
+    if existing_mac:
+        # MAC exists - check if assigned to different interface
+        if existing_mac.assigned_object_id != interface.id:
+            if verbose:
+                print(f"    Reassigning MAC {mac_address} to {interface.name}", file=sys.stderr)
+            existing_mac.assigned_object_type = "dcim.interface"
+            existing_mac.assigned_object_id = interface.id
+            existing_mac.save()
+        return existing_mac
+
+    if verbose:
+        print(f"    Creating MAC {mac_address} for {interface.name}", file=sys.stderr)
+
+    return nb.dcim.mac_addresses.create(
+        mac_address=mac_address,
+        assigned_object_type="dcim.interface",
+        assigned_object_id=interface.id,
+    )
+
+
+def ensure_device_interface(
+    nb,
+    device,
+    name: str,
+    mac_address: str,
+    iface_type: str,
+    dry_run: bool = False,
+    verbose: bool = False,
+):
+    """Ensure an interface exists on a device with the correct MAC address."""
+    if not mac_address:
+        return None
+
+    # Check for existing interface
+    existing = nb.dcim.interfaces.get(device_id=device.id, name=name)
+
+    if existing:
+        # Ensure MAC is assigned (uses new NetBox MAC address model)
+        ensure_mac_address(nb, existing, mac_address, dry_run=dry_run, verbose=verbose)
+        return existing
+
+    if dry_run:
+        print(f"    Would create interface {name} with MAC: {mac_address}")
+        return None
+
+    if verbose:
+        print(f"    Creating interface {name}", file=sys.stderr)
+
+    # Create interface without MAC (MAC is a separate object in newer NetBox)
+    interface = nb.dcim.interfaces.create(
+        device=device.id,
+        name=name,
+        type=iface_type,
+    )
+
+    # Assign MAC address
+    ensure_mac_address(nb, interface, mac_address, dry_run=dry_run, verbose=verbose)
+
+    return interface
+
+
+def sync_device(
+    nb,
+    panel_data: PanelData,
+    site,
+    location,
+    device_type,
+    device_role,
+    dry_run: bool = False,
+    verbose: bool = False,
+):
+    """Create or update a device for the SPAN panel."""
+    if not device_type or not device_role or not site:
+        return None
+
+    # Look for existing device by serial number
+    device = nb.dcim.devices.get(serial=panel_data.serial_number)
+    device_name = f"SPAN-{panel_data.serial_number}"
+    is_new = False
+
+    if device:
+        if verbose:
+            print(f"  Device '{device.name}' already exists", file=sys.stderr)
+    else:
+        if dry_run:
+            print(f"  Would create device: {device_name}")
+            print(f"    Serial: {panel_data.serial_number}")
+            if panel_data.eth0_mac:
+                print(f"    eth0 MAC: {panel_data.eth0_mac}")
+            if panel_data.eth1_mac:
+                print(f"    eth1 MAC: {panel_data.eth1_mac}")
+            if panel_data.wlan0_mac:
+                print(f"    wlan0 MAC: {panel_data.wlan0_mac}")
+            if panel_data.wlan0_ap_mac:
+                print(f"    wlan0-ap MAC: {panel_data.wlan0_ap_mac}")
+            if panel_data.ip_addresses:
+                print(f"    IPs: {', '.join(panel_data.ip_addresses)}")
+            return None
+
+        if verbose:
+            print(f"  Creating device: {device_name}", file=sys.stderr)
+
+        device_data = {
+            "name": device_name,
+            "device_type": device_type.id,
+            "role": device_role.id,
+            "site": site.id,
+            "serial": panel_data.serial_number,
+            "status": "active",
+        }
+        if location:
+            device_data["location"] = location.id
+
+        device = nb.dcim.devices.create(device_data)
+        is_new = True
+
+    # Ensure interfaces exist with correct MACs (for both new and existing devices)
+    eth0 = ensure_device_interface(
+        nb, device, "eth0", panel_data.eth0_mac, "1000base-t",
+        dry_run=dry_run, verbose=verbose
+    )
+
+    # eth1 is optional - only present on some panel models
+    if panel_data.eth1_mac:
+        ensure_device_interface(
+            nb, device, "eth1", panel_data.eth1_mac, "1000base-t",
+            dry_run=dry_run, verbose=verbose
+        )
+
+    # Assign IP to eth0 if not already assigned
+    if eth0 and panel_data.ip_addresses and not dry_run:
+        ipv4_addrs = [ip for ip in panel_data.ip_addresses if ":" not in ip]
+        if ipv4_addrs:
+            # Check if IP already exists
+            existing_ip = nb.ipam.ip_addresses.get(address=f"{ipv4_addrs[0]}/24")
+            if not existing_ip:
+                if verbose:
+                    print(f"    Assigning IP {ipv4_addrs[0]} to eth0", file=sys.stderr)
+                ip_obj = nb.ipam.ip_addresses.create(
+                    address=f"{ipv4_addrs[0]}/24",
+                    assigned_object_type="dcim.interface",
+                    assigned_object_id=eth0.id,
+                )
+                # Set as primary IP if not set
+                if not device.primary_ip4:
+                    device.primary_ip4 = ip_obj.id
+                    device.save()
+
+    ensure_device_interface(
+        nb, device, "wlan0", panel_data.wlan0_mac, "ieee802.11ax",
+        dry_run=dry_run, verbose=verbose
+    )
+
+    # Create wlan0-ap interface for AP mode MAC (virtual interface on same radio)
+    ensure_device_interface(
+        nb, device, "wlan0-ap", panel_data.wlan0_ap_mac, "ieee802.11ax",
+        dry_run=dry_run, verbose=verbose
+    )
+
+    return device
+
+
+def link_device_to_power_panel(nb, power_panel, device, dry_run: bool = False, verbose: bool = False):
+    """Link a device to a power panel via the associated_device custom field."""
+    if not power_panel or not device:
+        return
+
+    current = power_panel.custom_fields.get("associated_device")
+    if current and current.get("id") == device.id:
+        if verbose:
+            print(f"  Device already linked to power panel", file=sys.stderr)
+        return
+
+    if dry_run:
+        print(f"  Would link device {device.name} to power panel {power_panel.name}")
+        return
+
+    if verbose:
+        print(f"  Linking device {device.name} to power panel {power_panel.name}", file=sys.stderr)
+
+    power_panel.custom_fields["associated_device"] = device.id
+    power_panel.save()
+
+
+def ensure_custom_fields(nb: pynetbox.api, dry_run: bool = False, verbose: bool = False) -> None:
+    """Ensure all required custom fields exist in NetBox."""
+    all_fields = {**POWER_PANEL_CUSTOM_FIELDS, **POWER_FEED_CUSTOM_FIELDS}
+
+    existing = {cf.name: cf for cf in nb.extras.custom_fields.all()}
+
+    for field_name, field_def in all_fields.items():
+        if field_name in existing:
+            if verbose:
+                print(f"  Custom field '{field_name}' already exists", file=sys.stderr)
+            continue
+
+        if dry_run:
+            print(f"  Would create custom field: {field_name}")
+        else:
+            if verbose:
+                print(f"  Creating custom field: {field_name}", file=sys.stderr)
+
+            cf_data = {
+                "name": field_name,
+                "type": field_def["type"],
+                "label": field_def["label"],
+                "description": field_def.get("description", ""),
+                "content_types": field_def["content_types"],
+            }
+
+            if "object_type" in field_def:
+                cf_data["object_type"] = field_def["object_type"]
+
+            try:
+                nb.extras.custom_fields.create(cf_data)
+            except pynetbox.RequestError as e:
+                print(f"  Warning: Could not create custom field '{field_name}': {e}", file=sys.stderr)
+
+
+def get_or_create_site(nb: pynetbox.api, site_name: str, dry_run: bool = False) -> Optional[Any]:
+    """Get or create a site."""
+    site = nb.dcim.sites.get(name=site_name)
+    if site:
+        return site
+
+    if dry_run:
+        print(f"  Would need to create site: {site_name}")
+        return None
+
+    # Create site with slug derived from name
+    slug = site_name.lower().replace(" ", "-").replace("_", "-")
+    return nb.dcim.sites.create(name=site_name, slug=slug)
+
+
+def get_or_create_location(
+    nb: pynetbox.api,
+    location_name: str,
+    site: Any,
+    dry_run: bool = False
+) -> Optional[Any]:
+    """Get or create a location within a site."""
+    if not location_name:
+        return None
+
+    location = nb.dcim.locations.get(name=location_name, site_id=site.id)
+    if location:
+        return location
+
+    if dry_run:
+        print(f"  Would need to create location: {location_name}")
+        return None
+
+    slug = location_name.lower().replace(" ", "-").replace("_", "-")
+    return nb.dcim.locations.create(
+        name=location_name,
+        slug=slug,
+        site=site.id,
+    )
+
+
+def sync_power_panel(
+    nb: pynetbox.api,
+    panel_data: PanelData,
+    site: Any,
+    location: Optional[Any],
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> Optional[Any]:
+    """Create or update a power panel in NetBox."""
+    # Look for existing panel by serial number
+    existing = None
+    for pp in nb.dcim.power_panels.filter(site_id=site.id):
+        if pp.custom_fields and pp.custom_fields.get("serial_number") == panel_data.serial_number:
+            existing = pp
+            break
+
+    panel_name = f"SPAN-{panel_data.serial_number}"
+
+    custom_field_data = {
+        "serial_number": panel_data.serial_number,
+        "vendor_name": panel_data.vendor_name,
+        "hardware_version": panel_data.hardware_version,
+        "main_breaker_rating": panel_data.main_breaker_rating,
+    }
+
+    if existing:
+        if verbose:
+            print(f"  Updating existing power panel: {existing.name}", file=sys.stderr)
+
+        if dry_run:
+            print(f"  Would update power panel: {existing.name}")
+            return existing
+
+        # Don't rename existing panels - only update custom fields
+        existing.custom_fields = {**existing.custom_fields, **custom_field_data}
+        existing.save()
+        return existing
+    else:
+        if dry_run:
+            print(f"  Would create power panel: {panel_name}")
+            return None
+
+        if verbose:
+            print(f"  Creating power panel: {panel_name}", file=sys.stderr)
+
+        pp_data = {
+            "name": panel_name,
+            "site": site.id,
+            "custom_fields": custom_field_data,
+        }
+        if location:
+            pp_data["location"] = location.id
+
+        return nb.dcim.power_panels.create(pp_data)
+
+
+def sync_power_feeds(
+    nb: pynetbox.api,
+    panel_data: PanelData,
+    power_panel: Any,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Create or update power feeds for circuits."""
+    if not power_panel:
+        return {}
+
+    # Get existing feeds for this panel
+    existing_feeds = {
+        pf.custom_fields.get("panel_circuit_id"): pf
+        for pf in nb.dcim.power_feeds.filter(power_panel_id=power_panel.id)
+        if pf.custom_fields and pf.custom_fields.get("panel_circuit_id")
+    }
+
+    results = {"created": 0, "updated": 0, "unchanged": 0}
+
+    for circuit_id, circuit in panel_data.circuits.items():
+        feed_name = circuit.name if circuit.name else f"Circuit {circuit_id}"
+
+        custom_field_data = {
+            "panel_circuit_id": circuit_id,
+            "panel_space": circuit.space,
+            "is_duplex": circuit.is_duplex,
+        }
+
+        if circuit_id in existing_feeds:
+            feed = existing_feeds[circuit_id]
+
+            # Check if update needed (ignore amperage if circuit has 0 rating)
+            amperage_changed = (
+                circuit.breaker_rating > 0 and
+                feed.amperage != circuit.breaker_rating
+            )
+            needs_update = (
+                feed.name != feed_name or
+                amperage_changed or
+                feed.custom_fields.get("panel_space") != circuit.space or
+                feed.custom_fields.get("is_duplex") != circuit.is_duplex
+            )
+
+            if needs_update:
+                if dry_run:
+                    print(f"    Would update feed: {feed_name}")
+                else:
+                    if verbose:
+                        print(f"    Updating feed: {feed_name}", file=sys.stderr)
+                    feed.name = feed_name
+                    # Only update amperage if we have a valid value (NetBox requires >= 1)
+                    if circuit.breaker_rating > 0:
+                        feed.amperage = circuit.breaker_rating
+                    feed.custom_fields = {**feed.custom_fields, **custom_field_data}
+                    feed.save()
+                results["updated"] += 1
+            else:
+                results["unchanged"] += 1
+        else:
+            if dry_run:
+                print(f"    Would create feed: {feed_name}")
+            else:
+                if verbose:
+                    print(f"    Creating feed: {feed_name}", file=sys.stderr)
+
+                feed_data = {
+                    "name": feed_name,
+                    "power_panel": power_panel.id,
+                    "amperage": circuit.breaker_rating if circuit.breaker_rating > 0 else 1,
+                    "voltage": 120,  # Default US voltage
+                    "phase": "single-phase",
+                    "type": "primary",
+                    "status": "active",
+                    "custom_fields": custom_field_data,
+                }
+                nb.dcim.power_feeds.create(feed_data)
+            results["created"] += 1
+
+    return results
+
+
+def discover_panels_wrapper(timeout: float = 3.0) -> list[dict]:
+    """Discover SPAN panels using span-discover."""
+    import subprocess
+
+    discover_script = script_dir.parent.parent / "scripts" / "span-discover"
+    if not discover_script.exists():
+        print(f"Warning: span-discover not found at {discover_script}", file=sys.stderr)
+        return []
+
+    try:
+        result = subprocess.run(
+            [str(discover_script), "-j", "-t", str(int(timeout))],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 30
+        )
+
+        if result.returncode != 0:
+            return []
+
+        return json.loads(result.stdout)
+
+    except Exception as e:
+        print(f"Warning: Discovery failed: {e}", file=sys.stderr)
+        return []
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Import SPAN panel and circuit data into NetBox",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment Variables:
+  NETBOX_URL        NetBox instance URL (required)
+  NETBOX_TOKEN      NetBox API token (required)
+  NETBOX_SITE       Site name for panels (required)
+  NETBOX_LOCATION   Optional location within site
+  SPAN_AUTH_FILE    Override credential file path (default: ~/.span-auth.json)
+
+Examples:
+  # Import all configured panels
+  span-netbox-importer --all-panels
+
+  # Import specific panel
+  span-netbox-importer --panel ab-1234-c5d67
+
+  # Dry run to see what would be done
+  span-netbox-importer --all-panels --dry-run
+
+  # Verbose output
+  span-netbox-importer --panel ab-1234-c5d67 --verbose
+        """,
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes"
+    )
+    parser.add_argument(
+        "--panel",
+        action="append",
+        metavar="SERIAL",
+        help="Import specific panel (can be repeated)"
+    )
+    parser.add_argument(
+        "--all-panels",
+        action="store_true",
+        help="Import all configured panels"
+    )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Discover panels on network (requires credentials to be configured)"
+    )
+    parser.add_argument(
+        "--create-devices",
+        action="store_true",
+        help="Also create device objects for panels with interfaces and IPs"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="MQTT data collection timeout in seconds (default: 10)"
+    )
+
+    args = parser.parse_args()
+
+    # Import dependencies (deferred to allow --help without installing deps)
+    try:
+        import paho.mqtt.client as mqtt
+        import pynetbox
+        from span_auth_utils import (
+            get_panel_credentials,
+            list_panels,
+            ensure_ca_cert,
+            load_auth_file,
+        )
+    except ImportError as e:
+        print(f"Error: Missing dependency: {e}", file=sys.stderr)
+        print("Install dependencies with: pip install -r requirements.txt", file=sys.stderr)
+        sys.exit(1)
+
+    # Make mqtt available to SpanMqttCollector class
+    globals()["mqtt"] = mqtt
+
+    # Validate environment
+    netbox_url = os.environ.get("NETBOX_URL")
+    netbox_token = os.environ.get("NETBOX_TOKEN")
+    netbox_site = os.environ.get("NETBOX_SITE")
+    netbox_location = os.environ.get("NETBOX_LOCATION")
+
+    missing = []
+    if not netbox_url:
+        missing.append("NETBOX_URL")
+    if not netbox_token:
+        missing.append("NETBOX_TOKEN")
+    if not netbox_site:
+        missing.append("NETBOX_SITE")
+
+    if missing:
+        print(f"Error: Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine which panels to import
+    panel_serials = []
+
+    if args.panel:
+        panel_serials = args.panel
+    elif args.all_panels:
+        configured = list_panels()
+        if not configured:
+            print("Error: No panels configured. Run 'span-auth setup' first.", file=sys.stderr)
+            sys.exit(1)
+        panel_serials = [p["serial_number"] for p in configured]
+    elif args.discover:
+        print("Discovering SPAN panels...", file=sys.stderr)
+        discovered = discover_panels_wrapper()
+        if not discovered:
+            print("No panels discovered. Ensure panels are on the network.", file=sys.stderr)
+            sys.exit(1)
+        panel_serials = [p["serial_number"] for p in discovered]
+        print(f"Found {len(panel_serials)} panel(s)", file=sys.stderr)
+    else:
+        parser.print_help()
+        print("\nError: Specify --panel, --all-panels, or --discover", file=sys.stderr)
+        sys.exit(1)
+
+    # Connect to NetBox
+    if args.verbose:
+        print(f"Connecting to NetBox: {netbox_url}", file=sys.stderr)
+
+    nb = pynetbox.api(netbox_url, token=netbox_token)
+
+    # Ensure custom fields exist
+    print("Checking custom fields...", file=sys.stderr)
+    try:
+        ensure_custom_fields(nb, dry_run=args.dry_run, verbose=args.verbose)
+    except Exception as e:
+        print(f"Error: Could not connect to NetBox at {netbox_url}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Get or create site and location
+    site = get_or_create_site(nb, netbox_site, dry_run=args.dry_run)
+    if not site and not args.dry_run:
+        print(f"Error: Could not find or create site '{netbox_site}'", file=sys.stderr)
+        sys.exit(1)
+
+    location = None
+    if netbox_location and site:
+        location = get_or_create_location(nb, netbox_location, site, dry_run=args.dry_run)
+
+    # Set up device prerequisites if --create-devices
+    # Note: device_type is created per-panel based on model from mDNS
+    manufacturer = None
+    device_role = None
+    if args.create_devices:
+        print("Setting up device prerequisites...", file=sys.stderr)
+        manufacturer = ensure_manufacturer(nb, "SPAN", dry_run=args.dry_run, verbose=args.verbose)
+        device_role = ensure_device_role(nb, "Smart Panel", dry_run=args.dry_run, verbose=args.verbose)
+
+    # Process each panel
+    summary = {
+        "panels_processed": 0,
+        "panels_created": 0,
+        "panels_updated": 0,
+        "feeds_created": 0,
+        "feeds_updated": 0,
+        "devices_created": 0,
+        "devices_updated": 0,
+        "errors": 0,
+    }
+
+    for serial in panel_serials:
+        print(f"\nProcessing panel: {serial}", file=sys.stderr)
+
+        # Get credentials
+        creds = get_panel_credentials(serial)
+        if not creds:
+            print(f"  Error: No credentials for panel '{serial}'. Run 'span-auth setup {serial}'.", file=sys.stderr)
+            summary["errors"] += 1
+            continue
+
+        hostname = creds.get("hostname", f"span-{serial}.local")
+        password = creds.get("ebus_broker_password")
+
+        if not password:
+            print(f"  Error: No MQTT password for panel '{serial}'", file=sys.stderr)
+            summary["errors"] += 1
+            continue
+
+        # Ensure CA cert
+        try:
+            ca_cert_path = ensure_ca_cert(serial, hostname)
+        except Exception as e:
+            print(f"  Error getting CA cert: {e}", file=sys.stderr)
+            summary["errors"] += 1
+            continue
+
+        # Collect data via MQTT
+        print(f"  Collecting data via MQTT...", file=sys.stderr)
+        collector = SpanMqttCollector(
+            serial_number=serial,
+            hostname=hostname,
+            password=password,
+            ca_cert_path=ca_cert_path,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
+        panel_data = collector.collect()
+
+        if args.verbose:
+            print(f"  Hardware version: {panel_data.hardware_version}", file=sys.stderr)
+            print(f"  Main breaker: {panel_data.main_breaker_rating}A", file=sys.stderr)
+            print(f"  Circuits found: {len(panel_data.circuits)}", file=sys.stderr)
+
+        # Sync to NetBox
+        if not args.dry_run and not site:
+            print(f"  Skipping NetBox sync (site not available)", file=sys.stderr)
+            continue
+
+        power_panel = sync_power_panel(
+            nb, panel_data, site, location,
+            dry_run=args.dry_run, verbose=args.verbose
+        )
+
+        if power_panel:
+            summary["panels_updated" if hasattr(power_panel, "id") else "panels_created"] += 1
+
+        # Sync circuits as power feeds
+        feed_results = sync_power_feeds(
+            nb, panel_data, power_panel,
+            dry_run=args.dry_run, verbose=args.verbose
+        )
+        summary["feeds_created"] += feed_results.get("created", 0)
+        summary["feeds_updated"] += feed_results.get("updated", 0)
+
+        # Create device if requested
+        if args.create_devices:
+            # Query mDNS for device info (MAC addresses, IPs)
+            if args.verbose:
+                print(f"  Querying mDNS for device info...", file=sys.stderr)
+            device_info = query_device_info_mdns(serial, timeout=3.0)
+            panel_data.model = device_info.get("model", "")
+            panel_data.firmware_version = device_info.get("firmware_version", "")
+            panel_data.eth0_mac = device_info.get("eth0_mac", "")
+            panel_data.eth1_mac = device_info.get("eth1_mac", "")
+            panel_data.wlan0_mac = device_info.get("wlan0_mac", "")
+            panel_data.wlan0_ap_mac = device_info.get("wlan0_ap_mac", "")
+            panel_data.ip_addresses = device_info.get("addresses", [])
+
+            if args.verbose:
+                if panel_data.model:
+                    print(f"  Model: {panel_data.model}", file=sys.stderr)
+                if panel_data.eth0_mac:
+                    print(f"  eth0 MAC: {panel_data.eth0_mac}", file=sys.stderr)
+                if panel_data.eth1_mac:
+                    print(f"  eth1 MAC: {panel_data.eth1_mac}", file=sys.stderr)
+                if panel_data.wlan0_mac:
+                    print(f"  wlan0 MAC: {panel_data.wlan0_mac}", file=sys.stderr)
+                if panel_data.wlan0_ap_mac:
+                    print(f"  wlan0-ap MAC: {panel_data.wlan0_ap_mac}", file=sys.stderr)
+                if panel_data.ip_addresses:
+                    print(f"  IP addresses: {', '.join(panel_data.ip_addresses)}", file=sys.stderr)
+
+            # Create device type based on model from mDNS (e.g., "SPAN32")
+            device_type_name = panel_data.model if panel_data.model else "SPAN Panel"
+            device_type = ensure_device_type(
+                nb, manufacturer, device_type_name,
+                dry_run=args.dry_run, verbose=args.verbose
+            )
+
+            device = sync_device(
+                nb, panel_data, site, location, device_type, device_role,
+                dry_run=args.dry_run, verbose=args.verbose
+            )
+            if device:
+                if nb.dcim.devices.get(serial=panel_data.serial_number):
+                    summary["devices_updated"] += 1
+                else:
+                    summary["devices_created"] += 1
+
+                # Link device to power panel
+                link_device_to_power_panel(
+                    nb, power_panel, device,
+                    dry_run=args.dry_run, verbose=args.verbose
+                )
+
+        summary["panels_processed"] += 1
+
+    # Print summary
+    print("\n" + "=" * 50, file=sys.stderr)
+    print("Summary:", file=sys.stderr)
+    print(f"  Panels processed: {summary['panels_processed']}", file=sys.stderr)
+    if args.dry_run:
+        print("  (dry run - no changes made)", file=sys.stderr)
+    else:
+        print(f"  Panels created: {summary['panels_created']}", file=sys.stderr)
+        print(f"  Panels updated: {summary['panels_updated']}", file=sys.stderr)
+        print(f"  Feeds created: {summary['feeds_created']}", file=sys.stderr)
+        print(f"  Feeds updated: {summary['feeds_updated']}", file=sys.stderr)
+        if args.create_devices:
+            print(f"  Devices created: {summary['devices_created']}", file=sys.stderr)
+            print(f"  Devices updated: {summary['devices_updated']}", file=sys.stderr)
+    if summary["errors"]:
+        print(f"  Errors: {summary['errors']}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
