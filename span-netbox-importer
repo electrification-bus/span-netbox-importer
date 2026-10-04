@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import ssl
+import stat
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -21,12 +23,10 @@ if TYPE_CHECKING:
 
 __version__ = "0.2.0"
 
-# span_auth_utils and span-discover come from a SPAN-API-Client-Docs checkout:
-# $SPAN_API_DIR if set, else two levels above this script (resolving symlinks).
-script_dir = Path(__file__).resolve().parent
-span_api_dir = Path(os.environ.get("SPAN_API_DIR", script_dir.parent.parent)).expanduser()
-lib_dir = span_api_dir / "lib"
-sys.path.insert(0, str(lib_dir))
+# Same locations and environment overrides as SPAN's span-auth tool, which
+# writes the credential file and shares the CA certificate cache.
+DEFAULT_AUTH_FILE = Path.home() / ".span-auth.json"
+DEFAULT_CA_CERT_DIR = Path.home() / ".span-ca-certs"
 
 CIRCUIT_DEVICE_TYPE = "energy.ebus.device.circuit"
 
@@ -946,32 +946,117 @@ def usable_collection(collector: SpanMqttCollector) -> bool:
     return True
 
 
-def discover_panels_wrapper(timeout: float = 3.0) -> list[dict]:
-    """Discover SPAN panels using span-discover."""
-    import subprocess
+def auth_file_path() -> Path:
+    return Path(os.environ.get("SPAN_AUTH_FILE", DEFAULT_AUTH_FILE)).expanduser()
 
-    discover_script = span_api_dir / "scripts" / "span-discover"
-    if not discover_script.exists():
-        print(f"Warning: span-discover not found at {discover_script}", file=sys.stderr)
-        return []
 
+def ca_cert_dir() -> Path:
+    return Path(os.environ.get("SPAN_CA_CERT_DIR", DEFAULT_CA_CERT_DIR)).expanduser()
+
+
+def load_auth_file() -> dict:
+    """Load span-auth's credential file; empty when it does not exist."""
+    path = auth_file_path()
+    if not path.exists():
+        return {"panels": {}}
+    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(f"Warning: {path} has insecure permissions. Run 'chmod 600 {path}' to fix.", file=sys.stderr)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except ValueError as e:
+        print(f"Error: {path} is not valid JSON: {e}", file=sys.stderr)
+        return {"panels": {}}
+    return data if isinstance(data, dict) else {"panels": {}}
+
+
+def configured_panels() -> dict:
+    return load_auth_file().get("panels") or {}
+
+
+def list_panels() -> list[str]:
+    """Serial numbers of the panels in the credential file."""
+    return list(configured_panels())
+
+
+def get_panel_credentials(serial_number: str) -> dict | None:
+    return configured_panels().get(serial_number)
+
+
+def cert_expiring(cert_path: Path) -> bool:
+    """True if the certificate expires within a day, or its expiry cannot be checked."""
     try:
         result = subprocess.run(
-            [str(discover_script), "-j", "-t", str(int(timeout))],
+            ["openssl", "x509", "-in", str(cert_path), "-checkend", "86400", "-noout"],
             capture_output=True,
-            text=True,
-            timeout=timeout + 30,
             check=False,
         )
+    except OSError as e:
+        print(f"  Warning: could not check CA certificate expiry ({e}); downloading it again", file=sys.stderr)
+        return True
+    return result.returncode != 0
 
-        if result.returncode != 0:
-            return []
 
-        return json.loads(result.stdout)
+def ensure_ca_cert(serial_number: str, hostname: str) -> Path:
+    """Return the panel's cached CA certificate, downloading it if missing or expiring."""
+    import requests
 
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
+    cert_path = ca_cert_dir() / f"{serial_number}.crt"
+    if cert_path.exists() and not cert_expiring(cert_path):
+        return cert_path
+
+    response = requests.get(f"http://{hostname}/api/v2/certificate/ca", timeout=10)
+    response.raise_for_status()
+    if "-----BEGIN CERTIFICATE-----" not in response.text:
+        raise ValueError(f"{hostname} did not return a PEM certificate")
+
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    cert_path.write_text(response.text)
+    print(f"  Downloaded CA certificate to {cert_path}", file=sys.stderr)
+    return cert_path
+
+
+EBUS_SERVICE = "_ebus._tcp.local."
+
+
+def serial_from_instance(name: str) -> str | None:
+    """Panel serial from an eBus mDNS instance name such as "span-<serial>-EBUS._ebus._tcp.local."."""
+    instance = name.split("._")[0]
+    if not instance.lower().startswith("span-") or not instance.upper().endswith("-EBUS"):
+        return None
+    return instance[len("span-") : -len("-EBUS")] or None
+
+
+def discover_panels(timeout: float = 6.0) -> list[str]:
+    """Serial numbers of the SPAN panels advertising eBus on the local network."""
+    from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+
+    serials: set[str] = set()
+
+    class Listener(ServiceListener):
+        def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            serial = serial_from_instance(name)
+            if serial:
+                serials.add(serial)
+
+        def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+        def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+            pass
+
+    try:
+        zeroconf = Zeroconf()
+    except OSError as e:
         print(f"Warning: Discovery failed: {e}", file=sys.stderr)
         return []
+    browser = ServiceBrowser(zeroconf, EBUS_SERVICE, Listener())
+    try:
+        time.sleep(timeout)
+    finally:
+        browser.cancel()
+        zeroconf.close()
+    return sorted(serials)
 
 
 def main():
@@ -985,7 +1070,7 @@ Environment Variables:
   NETBOX_SITE       Site name for panels (required)
   NETBOX_LOCATION   Optional location within site
   SPAN_AUTH_FILE    Override credential file path (default: ~/.span-auth.json)
-  SPAN_API_DIR      SPAN-API-Client-Docs checkout (default: two directories above this script)
+  SPAN_CA_CERT_DIR  Override CA certificate cache (default: ~/.span-ca-certs)
 
 Examples:
   # Import all configured panels
@@ -1028,17 +1113,6 @@ Examples:
         print(f"Error: Missing dependency: {e}", file=sys.stderr)
         print("Install dependencies with: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
-    try:
-        from span_auth_utils import (
-            ensure_ca_cert,
-            get_panel_credentials,
-            list_panels,
-        )
-    except ImportError as e:
-        print(f"Error: {e} (looked in {lib_dir})", file=sys.stderr)
-        print("Set SPAN_API_DIR to a SPAN-API-Client-Docs checkout", file=sys.stderr)
-        sys.exit(1)
-
     # Bind the deferred imports for the module-level code that uses them
     globals().update(mqtt=mqtt, pynetbox=pynetbox)
 
@@ -1066,18 +1140,16 @@ Examples:
     if args.panel:
         panel_serials = args.panel
     elif args.all_panels:
-        configured = list_panels()
-        if not configured:
+        panel_serials = list_panels()
+        if not panel_serials:
             print("Error: No panels configured. Run 'span-auth setup' first.", file=sys.stderr)
             sys.exit(1)
-        panel_serials = [p["serial_number"] for p in configured]
     elif args.discover:
         print("Discovering SPAN panels...", file=sys.stderr)
-        discovered = discover_panels_wrapper()
-        if not discovered:
+        panel_serials = discover_panels()
+        if not panel_serials:
             print("No panels discovered. Ensure panels are on the network.", file=sys.stderr)
             sys.exit(1)
-        panel_serials = [p["serial_number"] for p in discovered]
         print(f"Found {len(panel_serials)} panel(s)", file=sys.stderr)
     else:
         parser.print_help()
@@ -1150,7 +1222,7 @@ Examples:
         # Ensure CA cert
         try:
             ca_cert_path = ensure_ca_cert(serial, hostname)
-        except (OSError, requests.RequestException) as e:
+        except (OSError, ValueError, requests.RequestException) as e:
             print(f"  Error getting CA cert: {e}", file=sys.stderr)
             summary["errors"] += 1
             continue
