@@ -4,6 +4,10 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- eBus discovery and MQTT access use [ebus-sdk](https://github.com/electrification-bus/python-sdk) instead of the importer's own paho-mqtt code. `requirements.txt` replaces `paho-mqtt` with `ebus-sdk>=0.24,<0.25`. The broker connection always verifies the panel's CA certificate. The importer keeps its own rules for which panel and circuit values must arrive before anything is written to NetBox; live meter updates no longer delay the end of collection.
+
 ## [0.3.0] - 2026-10-04
 
 ### Changed

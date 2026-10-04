@@ -138,7 +138,7 @@ The importer automatically creates the following custom fields in NetBox:
 
 3. **Connect to Panels**: For each panel:
    - Downloads the CA certificate (if not cached)
-   - Connects to the panel's MQTT broker over TLS
+   - Connects to the panel's MQTT broker over verified TLS with [ebus-sdk](https://github.com/electrification-bus/python-sdk), which discovers the panel's eBus device tree
    - Reads the panel device's `$description` and its `children` list
    - Reads each child's `$description` and keeps those of type `energy.ebus.device.circuit`
    - Collects hardware version, main breaker rating, and circuit details
@@ -225,7 +225,7 @@ ruff check . && ruff format --check .
 pytest
 ```
 
-The tests run offline: they feed synthetic MQTT messages to the collector and use stand-ins for the NetBox API. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution and release process, and [CHANGELOG.md](CHANGELOG.md) for release history.
+The tests run offline: they build synthetic ebus-sdk device trees for the collector and use stand-ins for the NetBox API. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution and release process, and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
