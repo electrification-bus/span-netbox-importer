@@ -4,6 +4,8 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-04
+
 ### Changed
 
 - The importer no longer needs a SPAN-API-Client-Docs checkout. It reads `span-auth`'s credential file (`~/.span-auth.json`, or `SPAN_AUTH_FILE`) itself, downloads and caches each panel's CA certificate in the same cache `span-auth` uses (`~/.span-ca-certs`, or `SPAN_CA_CERT_DIR`), and `--discover` browses mDNS for `_ebus._tcp` instead of running `span-discover`, listening for 6 seconds rather than 3, which missed a panel in testing. `span-auth setup` is still how credentials are created.
@@ -43,6 +45,7 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 - Initial importer: SPAN panels as NetBox power panels and circuits as power feeds over the panel's eBus MQTT broker, with optional devices, interfaces, MAC and IP addresses from mDNS.
 
-[Unreleased]: https://github.com/electrification-bus/span-netbox-importer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/span-netbox-importer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/electrification-bus/span-netbox-importer/releases/tag/v0.3.0
 [0.2.0]: https://github.com/electrification-bus/span-netbox-importer/releases/tag/v0.2.0
 [0.1.0]: https://github.com/electrification-bus/span-netbox-importer/commit/c89279e
