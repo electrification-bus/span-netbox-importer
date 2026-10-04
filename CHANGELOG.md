@@ -4,6 +4,8 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-04
+
 ### Changed
 
 - eBus discovery and MQTT access use [ebus-sdk](https://github.com/electrification-bus/python-sdk) instead of the importer's own paho-mqtt code. `requirements.txt` replaces `paho-mqtt` with `ebus-sdk>=0.24,<0.25`. The broker connection always verifies the panel's CA certificate. The importer keeps its own rules for which panel and circuit values must arrive before anything is written to NetBox; live meter updates no longer delay the end of collection.
@@ -49,7 +51,8 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 - Initial importer: SPAN panels as NetBox power panels and circuits as power feeds over the panel's eBus MQTT broker, with optional devices, interfaces, MAC and IP addresses from mDNS.
 
-[Unreleased]: https://github.com/electrification-bus/span-netbox-importer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/electrification-bus/span-netbox-importer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/electrification-bus/span-netbox-importer/releases/tag/v0.4.0
 [0.3.0]: https://github.com/electrification-bus/span-netbox-importer/releases/tag/v0.3.0
 [0.2.0]: https://github.com/electrification-bus/span-netbox-importer/releases/tag/v0.2.0
 [0.1.0]: https://github.com/electrification-bus/span-netbox-importer/commit/c89279e

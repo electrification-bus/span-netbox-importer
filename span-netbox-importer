@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from ebus_sdk import Controller  # noqa: TC004
     from ebus_sdk.homie import DiscoveredDevice
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Same locations and environment overrides as SPAN's span-auth tool, which
 # writes the credential file and shares the CA certificate cache.
