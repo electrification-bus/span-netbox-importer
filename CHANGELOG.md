@@ -4,6 +4,16 @@ All notable changes to `span-netbox-importer` are recorded here. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- The importer no longer needs a SPAN-API-Client-Docs checkout. It reads `span-auth`'s credential file (`~/.span-auth.json`, or `SPAN_AUTH_FILE`) itself, downloads and caches each panel's CA certificate in the same cache `span-auth` uses (`~/.span-ca-certs`, or `SPAN_CA_CERT_DIR`), and `--discover` browses mDNS for `_ebus._tcp` instead of running `span-discover`, listening for 6 seconds rather than 3, which missed a panel in testing. `span-auth setup` is still how credentials are created.
+- A CA certificate download that is not a PEM certificate is rejected rather than cached, and the download uses 10-second connect and read timeouts.
+- An invalid credential file, or one whose `panels` is empty or null, is reported as an error instead of ending in a traceback.
+
+### Removed
+
+- `SPAN_API_DIR`.
+
 ## [0.2.0] - 2026-10-04
 
 ### Changed

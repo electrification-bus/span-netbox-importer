@@ -6,15 +6,16 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![NetBox](https://img.shields.io/badge/NetBox-4.7-blue)](https://netboxlabs.com/)
 
 Import SPAN electrical panel and circuit data into [NetBox](https://netboxlabs.com/), creating power panels and power feeds with detailed custom field data.
 
 ## Prerequisites
 
 - Python 3.10+
+- `openssl` on `PATH`, to check cached CA certificates for expiry
 - SPAN Panel firmware r202633 or later (eBus data model `1.0`, parent/child devices)
 - SPAN credentials configured via `span-auth setup` (from [SPAN-API](https://github.com/spanio/SPAN-API-Client-Docs))
-- A checkout of [SPAN-API-Client-Docs](https://github.com/spanio/SPAN-API-Client-Docs), for `lib/span_auth_utils.py` and `scripts/span-discover`
 - NetBox instance with API access
 - Network access to your SPAN panel(s)
 
@@ -51,7 +52,7 @@ This stores credentials in `~/.span-auth.json`.
 | `NETBOX_SITE` | Yes | Site name where panels will be created |
 | `NETBOX_LOCATION` | No | Optional location within the site |
 | `SPAN_AUTH_FILE` | No | Override credential file path (default: `~/.span-auth.json`) |
-| `SPAN_API_DIR` | Yes, unless the importer sits two directories below the checkout | SPAN-API-Client-Docs checkout (default: two directories above the script) |
+| `SPAN_CA_CERT_DIR` | No | Override the CA certificate cache, shared with `span-auth` (default: `~/.span-ca-certs`) |
 
 Example:
 
@@ -60,7 +61,6 @@ export NETBOX_URL="https://netbox.example.com"
 export NETBOX_TOKEN="your-api-token-here"
 export NETBOX_SITE="Home"
 export NETBOX_LOCATION="Garage"
-export SPAN_API_DIR="$HOME/src/SPAN-API-Client-Docs"
 ```
 
 ## Usage
@@ -72,7 +72,7 @@ Options:
   --dry-run           Show what would be done without making changes
   --panel SERIAL      Import specific panel (can be repeated)
   --all-panels        Import all configured panels
-  --discover          Discover panels on network first
+  --discover          Import panels advertising eBus over mDNS (_ebus._tcp)
   --create-devices    Also create device objects with interfaces and IPs
   --verbose, -v       Verbose output
   --timeout SECONDS   MQTT data collection timeout (default: 10)
