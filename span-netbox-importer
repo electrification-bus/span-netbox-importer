@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     import paho.mqtt.client as mqtt  # noqa: TC004
     import pynetbox  # noqa: TC004
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Same locations and environment overrides as SPAN's span-auth tool, which
 # writes the credential file and shares the CA certificate cache.
