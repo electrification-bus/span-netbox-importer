@@ -1,39 +1,48 @@
 from types import SimpleNamespace
 
-from test_collector import CIRCUIT_1P, CIRCUIT_2P, PANEL, FakeClient, deliver, make_collector, publish_tree
+from test_collector import CIRCUIT_1P, CIRCUIT_2P, PANEL, circuit, device, panel, tree
 
 
-def connected_collector(importer):
-    collector = make_collector(importer)
-    collector._connected = True
+def make(importer, devices):
+    collector = importer.SpanTreeCollector(PANEL, "h", "pw", ca_cert_path=None)
+    collector.devices = devices
+    collector.read()
     return collector
 
 
 def test_unconnected_is_unusable(importer):
-    assert not importer.usable_collection(make_collector(importer))
+    assert not importer.usable_collection(make(importer, {}))
 
 
 def test_flat_model_panel_is_unusable(importer):
-    collector, client = connected_collector(importer), FakeClient()
-    deliver(collector, client, f"ebus/5/{PANEL}/$description", {"children": []})
-    deliver(collector, client, f"ebus/5/{PANEL}/core/breaker-rating", "200")
-    assert not importer.usable_collection(collector)
+    flat = {PANEL: device(PANEL, {"type": "energy.ebus.device.distribution-enclosure"}, core__breaker_rating="200")}
+    assert not importer.usable_collection(make(importer, flat))
 
 
 def test_panel_missing_main_breaker_is_unusable(importer):
-    collector, client = connected_collector(importer), FakeClient()
-    deliver(collector, client, f"ebus/5/{PANEL}/$description", {"children": []})
-    deliver(collector, client, f"ebus/5/{PANEL}/info/data-model-version", "1.0")
-    deliver(collector, client, f"ebus/5/{PANEL}/info/hardware-version", "1.2")
+    devices = {PANEL: panel([])}
+    devices[PANEL].properties["breaker"].pop("rating")
+    assert not importer.usable_collection(make(importer, devices))
+
+
+def test_panel_not_ready_is_unusable(importer):
+    devices = tree()
+    devices[PANEL].update_state("init")
+    assert not importer.usable_collection(make(importer, devices))
+
+
+def test_unresolvable_host_is_unusable(importer):
+    collector = importer.SpanTreeCollector(PANEL, "no-such-host.invalid", "pw", ca_cert_path=None)
+    collector.collect()
+    assert collector.error
     assert not importer.usable_collection(collector)
-    deliver(collector, client, f"ebus/5/{PANEL}/breaker/rating", "200")
-    assert importer.usable_collection(collector)
 
 
 def test_incomplete_circuit_is_dropped(importer):
-    collector, client = connected_collector(importer), FakeClient()
-    publish_tree(collector, client)
-    collector.panel_data.circuits[CIRCUIT_1P].received.discard("breaker/poles")
+    devices = tree()
+    devices[CIRCUIT_1P] = circuit(CIRCUIT_1P, "Attic", "5", "1")
+    devices[CIRCUIT_1P].properties["breaker"].pop("poles")
+    collector = make(importer, devices)
     assert importer.usable_collection(collector)
     assert set(collector.panel_data.circuits) == {CIRCUIT_2P}
 

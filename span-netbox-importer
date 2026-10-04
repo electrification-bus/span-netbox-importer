@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import ssl
+import socket
 import stat
 import subprocess
 import sys
@@ -18,8 +19,9 @@ from typing import TYPE_CHECKING, Any
 # Defer heavy imports until after argparse to allow --help without dependencies;
 # main() binds them as module globals.
 if TYPE_CHECKING:
-    import paho.mqtt.client as mqtt  # noqa: TC004
     import pynetbox  # noqa: TC004
+    from ebus_sdk import Controller  # noqa: TC004
+    from ebus_sdk.homie import DiscoveredDevice
 
 __version__ = "0.3.0"
 
@@ -29,6 +31,8 @@ DEFAULT_AUTH_FILE = Path.home() / ".span-auth.json"
 DEFAULT_CA_CERT_DIR = Path.home() / ".span-ca-certs"
 
 CIRCUIT_DEVICE_TYPE = "energy.ebus.device.circuit"
+# Capability nodes the importer reads, on the panel and on circuits
+READ_NODES = ("info", "breaker")
 
 
 # Custom field definitions for NetBox
@@ -161,8 +165,32 @@ class PanelData:
     ip_addresses: list[str] = field(default_factory=list)
 
 
-class SpanMqttCollector:
-    """Collects panel and circuit data via MQTT."""
+def _int(value: str | None) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_circuit(device: DiscoveredDevice) -> CircuitData:
+    """CircuitData from a discovered circuit device's retained values."""
+    circuit = CircuitData(circuit_id=device.device_id)
+    for prop in CircuitData.REQUIRED + ("breaker/rating",):
+        node, name = prop.split("/")
+        if device.get_property(node, name) is not None:
+            circuit.received.add(prop)
+    circuit.name = device.get_property("info", "name") or ""
+    circuit.breaker_rating = _int(device.get_property("breaker", "rating")) or 0
+    circuit.poles = _int(device.get_property("breaker", "poles")) or 1
+    spaces = [_int(x) for x in (device.get_property("info", "spaces") or "").split(",") if x.strip()]
+    circuit.spaces = [x for x in spaces if x is not None]
+    return circuit
+
+
+class SpanTreeCollector:
+    """Reads a panel's eBus device tree with ebus-sdk and applies the importer's completeness policy."""
+
+    PANEL_REQUIRED = ("info/data-model-version", "info/hardware-version", "breaker/rating")
 
     def __init__(
         self,
@@ -179,195 +207,122 @@ class SpanMqttCollector:
         self.ca_cert_path = ca_cert_path
         self.timeout = timeout
         self.verbose = verbose
-
-        self.panel_data = PanelData(serial_number=serial_number, hostname=hostname)
         self.device_id = serial_number
-        self.topic_root = "ebus/5"
-        self._connected = False
-        self._panel_described = False
-        # Panel properties received, as "node/property"
-        self._panel_received: set[str] = set()
-        # Child device ID -> True once its $description has been received
-        self._children: dict[str, bool] = {}
-        self._last_message = 0.0
+        self.devices: dict[str, DiscoveredDevice] = {}
+        self.panel_data = PanelData(serial_number=serial_number, hostname=hostname)
+        self.error: str | None = None
+        self._last_update = 0.0
 
     def _log(self, msg: str) -> None:
-        """Log message if verbose."""
         if self.verbose:
             print(f"  [MQTT] {msg}", file=sys.stderr)
 
-    def _subscribe(self, client: mqtt.Client, topic: str) -> None:
-        client.subscribe(topic)
-        self._log(f"Subscribed to {topic}")
-
-    def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, rc: int, properties: Any = None) -> None:
-        """Handle MQTT connection."""
-        if rc == 0:
-            self._connected = True
-            self._log(f"Connected to {self.hostname}")
-
-            # Panel (root) device: its $description lists the child devices
-            prefix = f"{self.topic_root}/{self.device_id}"
-            for topic in (f"{prefix}/$description", f"{prefix}/info/+", f"{prefix}/breaker/rating"):
-                self._subscribe(client, topic)
-        else:
-            print(f"  Connection failed with code {rc}", file=sys.stderr)
-
-    def _on_panel_description(self, client: mqtt.Client, description: dict) -> None:
-        self._panel_described = True
-        for child_id in description.get("children", []):
-            if child_id not in self._children:
-                self._children[child_id] = False
-                self._subscribe(client, f"{self.topic_root}/{child_id}/$description")
-
-    def _on_child_description(self, client: mqtt.Client, child_id: str, description: dict) -> None:
-        first = not self._children.get(child_id)
-        self._children[child_id] = True
-        # Classify by $description type; device IDs are opaque
-        if description.get("type") != CIRCUIT_DEVICE_TYPE:
-            return
-        if child_id not in self.panel_data.circuits:
-            self.panel_data.circuits[child_id] = CircuitData(circuit_id=child_id)
-        if first:
-            prefix = f"{self.topic_root}/{child_id}"
-            self._subscribe(client, f"{prefix}/info/+")
-            self._subscribe(client, f"{prefix}/breaker/+")
-
-    def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
-        """Handle MQTT message."""
-        payload = msg.payload.decode("utf-8", errors="replace")
-        self._log(f"Received: {msg.topic} = {payload[:50]}...")
-        self._last_message = time.time()
-
-        parts = msg.topic.split("/")
-        if len(parts) < 4 or "/".join(parts[:2]) != self.topic_root:
-            return
-        device_id = parts[2]
-
-        if parts[3] == "$description" and len(parts) == 4:
-            try:
-                description = json.loads(payload)
-            except ValueError:
-                return
-            if device_id == self.device_id:
-                self._on_panel_description(client, description)
-            elif device_id in self._children:
-                self._on_child_description(client, device_id, description)
-            return
-
-        if len(parts) != 5:
-            return
-        node, prop = parts[3], parts[4]
-
-        if device_id == self.device_id:
-            self._panel_received.add(f"{node}/{prop}")
-            if node == "info":
-                if prop == "hardware-version":
-                    self.panel_data.hardware_version = payload
-                elif prop == "vendor-name" and payload:
-                    self.panel_data.vendor_name = payload
-                elif prop == "model":
-                    self.panel_data.model = payload
-                elif prop == "firmware-version":
-                    self.panel_data.firmware_version = payload
-                elif prop == "data-model-version":
-                    self.panel_data.data_model_version = payload
-            elif node == "breaker" and prop == "rating":
-                try:
-                    self.panel_data.main_breaker_rating = int(payload)
-                except ValueError:
-                    pass
-            return
-
-        circuit = self.panel_data.circuits.get(device_id)
-        if not circuit:
-            return
-        circuit.received.add(f"{node}/{prop}")
-        if node == "info":
-            if prop == "name":
-                circuit.name = payload
-            elif prop == "spaces":
-                try:
-                    circuit.spaces = [int(x) for x in payload.split(",") if x.strip()]
-                except ValueError:
-                    pass
-        elif node == "breaker":
-            if prop == "rating":
-                try:
-                    circuit.breaker_rating = int(payload)
-                except ValueError:
-                    pass
-            elif prop == "poles":
-                try:
-                    circuit.poles = int(payload)
-                except ValueError:
-                    pass
-
-    PANEL_REQUIRED = ("info/data-model-version", "info/hardware-version", "breaker/rating")
+    def mqtt_cfg(self) -> dict:
+        return {
+            "host": self.hostname,
+            "port": 8883,
+            "use_tls": True,
+            "tls_ca_cert": str(self.ca_cert_path),
+            # ebus-mqtt-client defaults to an unverified connection
+            "tls_insecure": False,
+            "authentication": {"type": "USER_PASS", "username": self.serial_number, "password": self.password},
+        }
 
     @property
-    def panel_complete(self) -> bool:
-        """True once the panel is described and its required values have arrived."""
-        return self._panel_described and all(p in self._panel_received for p in self.PANEL_REQUIRED)
+    def root(self) -> DiscoveredDevice | None:
+        return self.devices.get(self.device_id)
 
     @property
     def connected(self) -> bool:
-        return self._connected
+        """True once the panel's retained $state has been received."""
+        return self.root is not None and self.root.state is not None
+
+    @property
+    def ready(self) -> bool:
+        """True when the panel's $state is ready; ebus-sdk subscribes to its children only then."""
+        return self.root is not None and self.root.state == "ready"
+
+    @property
+    def panel_complete(self) -> bool:
+        root = self.root
+        if root is None or root.description is None:
+            return False
+        return all(root.get_property(*p.split("/")) is not None for p in self.PANEL_REQUIRED)
+
+    def circuit_devices(self) -> list[DiscoveredDevice]:
+        """The panel's described children whose $description type is circuit."""
+        root = self.root
+        if root is None:
+            return []
+        children = (self.devices.get(cid) for cid in root.children_ids)
+        return [c for c in children if c and c.description and c.description.get("type") == CIRCUIT_DEVICE_TYPE]
 
     def _complete(self) -> bool:
-        """True once the panel and every child are complete."""
-        # list() snapshots the dicts, which the network thread mutates
-        return (
-            self.panel_complete
-            and all(list(self._children.values()))
-            and all(c.complete for c in list(self.panel_data.circuits.values()))
-        )
+        """True once the panel, each of its children, and each circuit's required values are present."""
+        if not self.panel_complete:
+            return False
+        if any(
+            self.devices.get(cid) is None or self.devices[cid].description is None for cid in self.root.children_ids
+        ):
+            return False
+        return all(read_circuit(c).complete for c in self.circuit_devices())
+
+    def _on_description(self, device: DiscoveredDevice) -> None:
+        self._last_update = time.time()
+
+    def _on_property(self, device_id: str, node: str, prop: str, value: str, old: str | None) -> None:
+        # Meter values stream continuously; only the nodes read here reset the quiet timer
+        if node in READ_NODES:
+            self._last_update = time.time()
+
+    def read(self) -> PanelData:
+        """Fill panel_data from the current device snapshot."""
+        data = PanelData(serial_number=self.serial_number, hostname=self.hostname)
+        root = self.root
+        if root is not None:
+            data.hardware_version = root.get_property("info", "hardware-version") or ""
+            data.vendor_name = root.get_property("info", "vendor-name") or data.vendor_name
+            data.model = root.get_property("info", "model") or ""
+            data.firmware_version = root.get_property("info", "firmware-version") or ""
+            data.data_model_version = root.get_property("info", "data-model-version") or ""
+            data.main_breaker_rating = _int(root.get_property("breaker", "rating")) or 0
+        for device in self.circuit_devices():
+            data.circuits[device.device_id] = read_circuit(device)
+        self.panel_data = data
+        return data
 
     def collect(self) -> PanelData:
-        """Connect to MQTT and collect panel/circuit data."""
-        client = mqtt.Client(
-            client_id=f"span-netbox-importer-{self.serial_number}",
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        )
-
-        client.username_pw_set(self.serial_number, self.password)
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
-
-        # Configure TLS
-        client.tls_set(
-            ca_certs=str(self.ca_cert_path),
-            cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS,
-        )
-
+        """Discover the panel's device tree and wait until its values are complete or the timeout passes."""
+        # The transport connects asynchronously and retries, so fail fast on a name that cannot resolve
         try:
-            self._log(f"Connecting to {self.hostname}:8883...")
-            client.connect(self.hostname, port=8883, keepalive=60)
-            client.loop_start()
+            socket.getaddrinfo(self.hostname, 8883)
+        except OSError as e:
+            self.error = f"cannot resolve {self.hostname}: {e}"
+            return self.panel_data
 
-            # Retained values arrive right after each subscribe. Wait until every
-            # child is described, then for a quiet second to let them land.
+        controller = Controller(mqtt_cfg=self.mqtt_cfg(), root_device_id=self.device_id)
+        controller.set_on_description_received_callback(self._on_description)
+        controller.set_on_property_changed_callback(self._on_property)
+        self._log(f"Connecting to {self.hostname}:8883...")
+        controller.start_discovery()
+        try:
+            # Retained values arrive right after each subscribe: wait until the
+            # tree is complete, then for a quiet second to let stragglers land.
             start_time = time.time()
             while time.time() - start_time < self.timeout:
-                if self._complete() and time.time() - self._last_message > 1.0:
+                # dict() copies atomically; the network thread mutates the original
+                self.devices = dict(controller.devices)
+                if self._complete() and time.time() - self._last_update > 1.0:
                     break
                 time.sleep(0.1)
             else:
-                undescribed = [c for c, done in list(self._children.items()) if not done]
-                if not self._panel_described:
-                    print("  Warning: panel $description not received before timeout", file=sys.stderr)
-                elif undescribed:
-                    print(
-                        f"  Warning: {len(undescribed)} child device(s) not described before timeout", file=sys.stderr
-                    )
-
-            client.loop_stop()
-            client.disconnect()
-
-        except (OSError, ValueError) as e:
-            print(f"  Error connecting to MQTT: {e}", file=sys.stderr)
-
+                self.devices = dict(controller.devices)
+                if self.connected:
+                    print("  Warning: panel tree incomplete at timeout", file=sys.stderr)
+            self.read()
+        finally:
+            controller.stop()
+        self._log(f"Devices discovered: {len(self.devices)}")
         return self.panel_data
 
 
@@ -927,15 +882,23 @@ def sync_power_feeds(
     return results
 
 
-def usable_collection(collector: SpanMqttCollector) -> bool:
+def usable_collection(collector: SpanTreeCollector) -> bool:
     """Guard NetBox from defaults left by a failed or partial collection.
 
     Returns False when the panel's own values were not all received. Otherwise
     drops each circuit that is missing a required value and returns True.
     """
     panel_data = collector.panel_data
+    if collector.error:
+        print(f"  Error: {collector.error}; skipping", file=sys.stderr)
+        return False
     if not collector.connected:
-        print("  Error: could not connect to the panel's MQTT broker; skipping", file=sys.stderr)
+        print(
+            "  Error: no data from the panel's MQTT broker (check credentials and network); skipping", file=sys.stderr
+        )
+        return False
+    if not collector.ready:
+        print(f"  Error: panel $state is {collector.root.state}, not ready; skipping", file=sys.stderr)
         return False
     if not collector.panel_complete:
         print("  Error: panel data incomplete (requires firmware r202633 or later); skipping", file=sys.stderr)
@@ -1106,15 +1069,18 @@ Examples:
 
     # Import dependencies (deferred to allow --help without installing deps)
     try:
-        import paho.mqtt.client as mqtt
         import pynetbox
         import requests
+        from ebus_sdk import Controller
     except ImportError as e:
         print(f"Error: Missing dependency: {e}", file=sys.stderr)
         print("Install dependencies with: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
+    # ebus-sdk and ebus-mqtt-client report through logging
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="  [%(name)s] %(message)s")
+
     # Bind the deferred imports for the module-level code that uses them
-    globals().update(mqtt=mqtt, pynetbox=pynetbox)
+    globals().update(Controller=Controller, pynetbox=pynetbox)
 
     # Validate environment
     netbox_url = os.environ.get("NETBOX_URL")
@@ -1229,7 +1195,7 @@ Examples:
 
         # Collect data via MQTT
         print("  Collecting data via MQTT...", file=sys.stderr)
-        collector = SpanMqttCollector(
+        collector = SpanTreeCollector(
             serial_number=serial,
             hostname=hostname,
             password=password,
