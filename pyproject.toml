@@ -1,0 +1,20 @@
+# Tool configuration only. The importer is a single script, not a package: its
+# version is __version__ in span-netbox-importer, and its runtime dependencies
+# are in requirements.txt.
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# The importer has no .py extension, so name it for ruff to find.
+extend-include = ["span-netbox-importer"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+ignore = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
