@@ -1,11 +1,20 @@
 # SPAN NetBox Importer
 
+[![Release](https://img.shields.io/github/v/release/electrification-bus/span-netbox-importer)](https://github.com/electrification-bus/span-netbox-importer/releases)
+[![Test](https://github.com/electrification-bus/span-netbox-importer/actions/workflows/test.yml/badge.svg)](https://github.com/electrification-bus/span-netbox-importer/actions/workflows/test.yml)
+[![Lint](https://github.com/electrification-bus/span-netbox-importer/actions/workflows/lint.yml/badge.svg)](https://github.com/electrification-bus/span-netbox-importer/actions/workflows/lint.yml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Import SPAN electrical panel and circuit data into [NetBox](https://netboxlabs.com/), creating power panels and power feeds with detailed custom field data.
 
 ## Prerequisites
 
 - Python 3.10+
+- SPAN Panel firmware r202633 or later (eBus data model `1.0`, parent/child devices)
 - SPAN credentials configured via `span-auth setup` (from [SPAN-API](https://github.com/spanio/SPAN-API-Client-Docs))
+- A checkout of [SPAN-API-Client-Docs](https://github.com/spanio/SPAN-API-Client-Docs), for `lib/span_auth_utils.py` and `scripts/span-discover`
 - NetBox instance with API access
 - Network access to your SPAN panel(s)
 
@@ -42,6 +51,7 @@ This stores credentials in `~/.span-auth.json`.
 | `NETBOX_SITE` | Yes | Site name where panels will be created |
 | `NETBOX_LOCATION` | No | Optional location within the site |
 | `SPAN_AUTH_FILE` | No | Override credential file path (default: `~/.span-auth.json`) |
+| `SPAN_API_DIR` | Yes, unless the importer sits two directories below the checkout | SPAN-API-Client-Docs checkout (default: two directories above the script) |
 
 Example:
 
@@ -50,6 +60,7 @@ export NETBOX_URL="https://netbox.example.com"
 export NETBOX_TOKEN="your-api-token-here"
 export NETBOX_SITE="Home"
 export NETBOX_LOCATION="Garage"
+export SPAN_API_DIR="$HOME/src/SPAN-API-Client-Docs"
 ```
 
 ## Usage
@@ -65,6 +76,7 @@ Options:
   --create-devices    Also create device objects with interfaces and IPs
   --verbose, -v       Verbose output
   --timeout SECONDS   MQTT data collection timeout (default: 10)
+  --version           Show version
   --help              Show help
 ```
 
@@ -114,9 +126,9 @@ The importer automatically creates the following custom fields in NetBox:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `panel_circuit_id` | Text | Circuit identifier from panel (e.g., "1a", "2b") |
-| `panel_space` | Integer | Physical space number in panel |
-| `is_duplex` | Boolean | Whether this is a duplex (double-pole) circuit |
+| `panel_circuit_id` | Text | Circuit device ID from the panel (e.g., `ac3dccda46a94b98878a227df6fed588`) |
+| `panel_space` | Integer | First physical space the circuit occupies in the panel |
+| `is_duplex` | Boolean | Whether this is a duplex (two or more poles) circuit |
 
 ## How It Works
 
@@ -127,17 +139,18 @@ The importer automatically creates the following custom fields in NetBox:
 3. **Connect to Panels**: For each panel:
    - Downloads the CA certificate (if not cached)
    - Connects to the panel's MQTT broker over TLS
-   - Subscribes to topics for panel properties and circuit data
+   - Reads the panel device's `$description` and its `children` list
+   - Reads each child's `$description` and keeps those of type `energy.ebus.device.circuit`
    - Collects hardware version, main breaker rating, and circuit details
 
 4. **Sync to NetBox**:
    - Creates or updates power panels with serial number, hardware info, and ratings
-   - Creates or updates power feeds for each circuit with name, amperage, and position
+   - Creates or updates power feeds for each circuit with name, amperage, voltage (240 V for two or more poles, else 120 V), and position
 
 5. **Create Devices** (with `--create-devices`):
    - Queries mDNS for device info (MAC addresses, IP addresses)
    - Creates manufacturer "SPAN" if not exists
-   - Creates device type "MAIN 32" if not exists
+   - Creates a device type named for the panel model (`MAIN_32` becomes "MAIN 32") if not exists
    - Creates device role "Smart Panel" if not exists
    - Creates device with interfaces (eth0, wlan0) and assigns IPs
    - Links device to power panel via `associated_device` custom field
@@ -149,12 +162,12 @@ The importer automatically creates the following custom fields in NetBox:
 ```
 SPAN Panel (MQTT)                    NetBox
 ─────────────────                    ──────
-core/hardware-version        →       Power Panel.custom_fields.hardware_version
-core/breaker-rating          →       Power Panel.custom_fields.main_breaker_rating
-{circuit}/name               →       Power Feed.name
-{circuit}/breaker-rating     →       Power Feed.amperage
-{circuit}/space              →       Power Feed.custom_fields.panel_space
-{circuit}/dipole             →       Power Feed.custom_fields.is_duplex
+{panel}/info/hardware-version  →     Power Panel.custom_fields.hardware_version
+{panel}/breaker/rating         →     Power Panel.custom_fields.main_breaker_rating
+{circuit}/info/name            →     Power Feed.name
+{circuit}/breaker/rating       →     Power Feed.amperage
+{circuit}/info/spaces          →     Power Feed.custom_fields.panel_space (first space)
+{circuit}/breaker/poles        →     Power Feed.custom_fields.is_duplex, Power Feed.voltage
 
 mDNS (_device-info)                  NetBox Device (with --create-devices)
 ───────────────────                  ─────────────
@@ -186,6 +199,7 @@ cd SPAN-API-Client-Docs/scripts
 ### Custom fields not created
 
 Ensure your NetBox API token has permissions to create custom fields. The token needs the following permissions:
+
 - `extras.add_customfield`
 - `dcim.add_powerpanel`
 - `dcim.change_powerpanel`
@@ -195,6 +209,7 @@ Ensure your NetBox API token has permissions to create custom fields. The token 
 ### Site not found
 
 The site specified in `NETBOX_SITE` must either:
+
 - Already exist in NetBox, OR
 - The API token must have `dcim.add_site` permission to create it
 
@@ -202,6 +217,16 @@ The site specified in `NETBOX_SITE` must either:
 
 - The importer does not delete circuits that have been removed from the panel
 
+## Development
+
+```bash
+pip install -r requirements.txt pytest ruff==0.16.1
+ruff check . && ruff format --check .
+pytest
+```
+
+The tests run offline: they feed synthetic MQTT messages to the collector and use stand-ins for the NetBox API. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution and release process, and [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## License
 
-See the repository LICENSE file.
+MIT. See [LICENSE](LICENSE).

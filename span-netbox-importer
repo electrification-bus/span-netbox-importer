@@ -11,17 +11,24 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
-# Defer heavy imports until after argparse to allow --help without dependencies
+# Defer heavy imports until after argparse to allow --help without dependencies;
+# main() binds them as module globals.
 if TYPE_CHECKING:
-    import paho.mqtt.client as mqtt
-    import pynetbox
+    import paho.mqtt.client as mqtt  # noqa: TC004
+    import pynetbox  # noqa: TC004
 
-# Add lib directory to path for imports (resolve symlinks)
+__version__ = "0.2.0"
+
+# span_auth_utils and span-discover come from a SPAN-API-Client-Docs checkout:
+# $SPAN_API_DIR if set, else two levels above this script (resolving symlinks).
 script_dir = Path(__file__).resolve().parent
-lib_dir = script_dir.parent.parent / "lib"
+span_api_dir = Path(os.environ.get("SPAN_API_DIR", script_dir.parent.parent)).expanduser()
+lib_dir = span_api_dir / "lib"
 sys.path.insert(0, str(lib_dir))
+
+CIRCUIT_DEVICE_TYPE = "energy.ebus.device.circuit"
 
 
 # Custom field definitions for NetBox
@@ -83,19 +90,19 @@ POWER_FEED_CUSTOM_FIELDS = {
     "panel_circuit_id": {
         "type": "text",
         "label": "Panel Circuit ID",
-        "description": "Circuit identifier from panel (e.g., 1a, 2b)",
+        "description": "Circuit device ID from panel",
         "content_types": ["dcim.powerfeed"],
     },
     "panel_space": {
         "type": "integer",
         "label": "Panel Space",
-        "description": "Physical space number in panel",
+        "description": "First physical space the circuit occupies in panel",
         "content_types": ["dcim.powerfeed"],
     },
     "is_duplex": {
         "type": "boolean",
         "label": "Is Duplex",
-        "description": "Whether this is a duplex (double-pole) circuit",
+        "description": "Whether this is a duplex (two or more poles) circuit",
         "content_types": ["dcim.powerfeed"],
     },
 }
@@ -108,8 +115,29 @@ class CircuitData:
     circuit_id: str
     name: str = ""
     breaker_rating: int = 0
-    space: int = 0
-    is_duplex: bool = False
+    spaces: list[int] = field(default_factory=list)
+    poles: int = 1
+    # Properties received from MQTT, as "node/property"
+    received: set[str] = field(default_factory=set)
+
+    REQUIRED = ("info/name", "info/spaces", "breaker/poles")
+
+    @property
+    def complete(self) -> bool:
+        return all(p in self.received for p in self.REQUIRED)
+
+    @property
+    def space(self) -> int:
+        """First panel position the circuit occupies (0 if unknown)."""
+        return self.spaces[0] if self.spaces else 0
+
+    @property
+    def is_duplex(self) -> bool:
+        return self.poles >= 2
+
+    @property
+    def voltage(self) -> int:
+        return 240 if self.is_duplex else 120
 
 
 @dataclass
@@ -120,6 +148,7 @@ class PanelData:
     hostname: str
     vendor_name: str = "SPAN"
     hardware_version: str = ""
+    data_model_version: str = ""
     main_breaker_rating: int = 0
     circuits: dict[str, CircuitData] = field(default_factory=dict)
     # Device info from mDNS (populated when --create-devices is used)
@@ -152,14 +181,24 @@ class SpanMqttCollector:
         self.verbose = verbose
 
         self.panel_data = PanelData(serial_number=serial_number, hostname=hostname)
-        self.topic_prefix = f"ebus/5/{serial_number}"
+        self.device_id = serial_number
+        self.topic_root = "ebus/5"
         self._connected = False
-        self._data_received = False
+        self._panel_described = False
+        # Panel properties received, as "node/property"
+        self._panel_received: set[str] = set()
+        # Child device ID -> True once its $description has been received
+        self._children: dict[str, bool] = {}
+        self._last_message = 0.0
 
     def _log(self, msg: str) -> None:
         """Log message if verbose."""
         if self.verbose:
             print(f"  [MQTT] {msg}", file=sys.stderr)
+
+    def _subscribe(self, client: mqtt.Client, topic: str) -> None:
+        client.subscribe(topic)
+        self._log(f"Subscribed to {topic}")
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, rc: int, properties: Any = None) -> None:
         """Handle MQTT connection."""
@@ -167,64 +206,122 @@ class SpanMqttCollector:
             self._connected = True
             self._log(f"Connected to {self.hostname}")
 
-            # Subscribe to panel topics
-            topics = [
-                f"{self.topic_prefix}/core/hardware-version",
-                f"{self.topic_prefix}/core/breaker-rating",
-                f"{self.topic_prefix}/+/name",
-                f"{self.topic_prefix}/+/breaker-rating",
-                f"{self.topic_prefix}/+/space",
-                f"{self.topic_prefix}/+/dipole",
-            ]
-            for topic in topics:
-                client.subscribe(topic)
-                self._log(f"Subscribed to {topic}")
+            # Panel (root) device: its $description lists the child devices
+            prefix = f"{self.topic_root}/{self.device_id}"
+            for topic in (f"{prefix}/$description", f"{prefix}/info/+", f"{prefix}/breaker/rating"):
+                self._subscribe(client, topic)
         else:
             print(f"  Connection failed with code {rc}", file=sys.stderr)
 
+    def _on_panel_description(self, client: mqtt.Client, description: dict) -> None:
+        self._panel_described = True
+        for child_id in description.get("children", []):
+            if child_id not in self._children:
+                self._children[child_id] = False
+                self._subscribe(client, f"{self.topic_root}/{child_id}/$description")
+
+    def _on_child_description(self, client: mqtt.Client, child_id: str, description: dict) -> None:
+        first = not self._children.get(child_id)
+        self._children[child_id] = True
+        # Classify by $description type; device IDs are opaque
+        if description.get("type") != CIRCUIT_DEVICE_TYPE:
+            return
+        if child_id not in self.panel_data.circuits:
+            self.panel_data.circuits[child_id] = CircuitData(circuit_id=child_id)
+        if first:
+            prefix = f"{self.topic_root}/{child_id}"
+            self._subscribe(client, f"{prefix}/info/+")
+            self._subscribe(client, f"{prefix}/breaker/+")
+
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
         """Handle MQTT message."""
-        topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="replace")
+        self._log(f"Received: {msg.topic} = {payload[:50]}...")
+        self._last_message = time.time()
 
-        self._log(f"Received: {topic} = {payload[:50]}...")
-        self._data_received = True
+        parts = msg.topic.split("/")
+        if len(parts) < 4 or "/".join(parts[:2]) != self.topic_root:
+            return
+        device_id = parts[2]
 
-        # Parse topic to extract component
-        parts = topic.replace(f"{self.topic_prefix}/", "").split("/")
+        if parts[3] == "$description" and len(parts) == 4:
+            try:
+                description = json.loads(payload)
+            except ValueError:
+                return
+            if device_id == self.device_id:
+                self._on_panel_description(client, description)
+            elif device_id in self._children:
+                self._on_child_description(client, device_id, description)
+            return
 
-        if len(parts) == 2:
-            component, prop = parts
+        if len(parts) != 5:
+            return
+        node, prop = parts[3], parts[4]
 
-            if component == "core":
+        if device_id == self.device_id:
+            self._panel_received.add(f"{node}/{prop}")
+            if node == "info":
                 if prop == "hardware-version":
                     self.panel_data.hardware_version = payload
-                elif prop == "breaker-rating":
-                    try:
-                        self.panel_data.main_breaker_rating = int(payload)
-                    except ValueError:
-                        pass
-            else:
-                # Circuit data
-                circuit_id = component
-                if circuit_id not in self.panel_data.circuits:
-                    self.panel_data.circuits[circuit_id] = CircuitData(circuit_id=circuit_id)
+                elif prop == "vendor-name" and payload:
+                    self.panel_data.vendor_name = payload
+                elif prop == "model":
+                    self.panel_data.model = payload
+                elif prop == "firmware-version":
+                    self.panel_data.firmware_version = payload
+                elif prop == "data-model-version":
+                    self.panel_data.data_model_version = payload
+            elif node == "breaker" and prop == "rating":
+                try:
+                    self.panel_data.main_breaker_rating = int(payload)
+                except ValueError:
+                    pass
+            return
 
-                circuit = self.panel_data.circuits[circuit_id]
-                if prop == "name":
-                    circuit.name = payload
-                elif prop == "breaker-rating":
-                    try:
-                        circuit.breaker_rating = int(payload)
-                    except ValueError:
-                        pass
-                elif prop == "space":
-                    try:
-                        circuit.space = int(payload)
-                    except ValueError:
-                        pass
-                elif prop == "dipole":
-                    circuit.is_duplex = payload.lower() in ("true", "1", "yes")
+        circuit = self.panel_data.circuits.get(device_id)
+        if not circuit:
+            return
+        circuit.received.add(f"{node}/{prop}")
+        if node == "info":
+            if prop == "name":
+                circuit.name = payload
+            elif prop == "spaces":
+                try:
+                    circuit.spaces = [int(x) for x in payload.split(",") if x.strip()]
+                except ValueError:
+                    pass
+        elif node == "breaker":
+            if prop == "rating":
+                try:
+                    circuit.breaker_rating = int(payload)
+                except ValueError:
+                    pass
+            elif prop == "poles":
+                try:
+                    circuit.poles = int(payload)
+                except ValueError:
+                    pass
+
+    PANEL_REQUIRED = ("info/data-model-version", "info/hardware-version", "breaker/rating")
+
+    @property
+    def panel_complete(self) -> bool:
+        """True once the panel is described and its required values have arrived."""
+        return self._panel_described and all(p in self._panel_received for p in self.PANEL_REQUIRED)
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def _complete(self) -> bool:
+        """True once the panel and every child are complete."""
+        # list() snapshots the dicts, which the network thread mutates
+        return (
+            self.panel_complete
+            and all(list(self._children.values()))
+            and all(c.complete for c in list(self.panel_data.circuits.values()))
+        )
 
     def collect(self) -> PanelData:
         """Connect to MQTT and collect panel/circuit data."""
@@ -249,19 +346,26 @@ class SpanMqttCollector:
             client.connect(self.hostname, port=8883, keepalive=60)
             client.loop_start()
 
-            # Wait for data
+            # Retained values arrive right after each subscribe. Wait until every
+            # child is described, then for a quiet second to let them land.
             start_time = time.time()
             while time.time() - start_time < self.timeout:
-                if self._data_received:
-                    # Give a bit more time for all messages
-                    time.sleep(2)
+                if self._complete() and time.time() - self._last_message > 1.0:
                     break
                 time.sleep(0.1)
+            else:
+                undescribed = [c for c, done in list(self._children.items()) if not done]
+                if not self._panel_described:
+                    print("  Warning: panel $description not received before timeout", file=sys.stderr)
+                elif undescribed:
+                    print(
+                        f"  Warning: {len(undescribed)} child device(s) not described before timeout", file=sys.stderr
+                    )
 
             client.loop_stop()
             client.disconnect()
 
-        except Exception as e:
+        except (OSError, ValueError) as e:
             print(f"  Error connecting to MQTT: {e}", file=sys.stderr)
 
         return self.panel_data
@@ -274,7 +378,7 @@ def query_device_info_mdns(serial_number: str, timeout: float = 3.0) -> dict:
     Returns dict with: model, firmware_version, hardware_version, eth0_mac, wlan0_mac,
                        wlan0_ap_mac, addresses
     """
-    from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+    from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
     result = {
         "model": "",
@@ -303,8 +407,7 @@ def query_device_info_mdns(serial_number: str, timeout: float = 3.0) -> dict:
             result["addresses"] = list(info.parsed_addresses())
             if info.properties:
                 props = {
-                    k.decode() if isinstance(k, bytes) else k:
-                    v.decode() if isinstance(v, bytes) else v
+                    k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
                     for k, v in info.properties.items()
                 }
                 result["model"] = props.get("model", "")
@@ -431,12 +534,10 @@ def ensure_mac_address(
     # Check if MAC already exists on this interface
     existing_macs = interface.mac_addresses or []
     for existing in existing_macs:
-        if isinstance(existing, str):
-            if existing.upper() == mac_upper:
-                return None  # Already assigned
-        elif hasattr(existing, 'mac_address'):
-            if existing.mac_address.upper() == mac_upper:
-                return None  # Already assigned
+        if isinstance(existing, str) and existing.upper() == mac_upper:
+            return None  # Already assigned
+        if hasattr(existing, "mac_address") and existing.mac_address.upper() == mac_upper:
+            return None  # Already assigned
 
     if dry_run:
         print(f"    Would assign MAC {mac_address} to {interface.name}")
@@ -522,7 +623,6 @@ def sync_device(
     # Look for existing device by serial number
     device = nb.dcim.devices.get(serial=panel_data.serial_number)
     device_name = f"SPAN-{panel_data.serial_number}"
-    is_new = False
 
     if device:
         if verbose:
@@ -558,20 +658,15 @@ def sync_device(
             device_data["location"] = location.id
 
         device = nb.dcim.devices.create(device_data)
-        is_new = True
 
     # Ensure interfaces exist with correct MACs (for both new and existing devices)
     eth0 = ensure_device_interface(
-        nb, device, "eth0", panel_data.eth0_mac, "1000base-t",
-        dry_run=dry_run, verbose=verbose
+        nb, device, "eth0", panel_data.eth0_mac, "1000base-t", dry_run=dry_run, verbose=verbose
     )
 
     # eth1 is optional - only present on some panel models
     if panel_data.eth1_mac:
-        ensure_device_interface(
-            nb, device, "eth1", panel_data.eth1_mac, "1000base-t",
-            dry_run=dry_run, verbose=verbose
-        )
+        ensure_device_interface(nb, device, "eth1", panel_data.eth1_mac, "1000base-t", dry_run=dry_run, verbose=verbose)
 
     # Assign IP to eth0 if not already assigned
     if eth0 and panel_data.ip_addresses and not dry_run:
@@ -592,15 +687,11 @@ def sync_device(
                     device.primary_ip4 = ip_obj.id
                     device.save()
 
-    ensure_device_interface(
-        nb, device, "wlan0", panel_data.wlan0_mac, "ieee802.11ax",
-        dry_run=dry_run, verbose=verbose
-    )
+    ensure_device_interface(nb, device, "wlan0", panel_data.wlan0_mac, "ieee802.11ax", dry_run=dry_run, verbose=verbose)
 
     # Create wlan0-ap interface for AP mode MAC (virtual interface on same radio)
     ensure_device_interface(
-        nb, device, "wlan0-ap", panel_data.wlan0_ap_mac, "ieee802.11ax",
-        dry_run=dry_run, verbose=verbose
+        nb, device, "wlan0-ap", panel_data.wlan0_ap_mac, "ieee802.11ax", dry_run=dry_run, verbose=verbose
     )
 
     return device
@@ -614,7 +705,7 @@ def link_device_to_power_panel(nb, power_panel, device, dry_run: bool = False, v
     current = power_panel.custom_fields.get("associated_device")
     if current and current.get("id") == device.id:
         if verbose:
-            print(f"  Device already linked to power panel", file=sys.stderr)
+            print("  Device already linked to power panel", file=sys.stderr)
         return
 
     if dry_run:
@@ -663,7 +754,7 @@ def ensure_custom_fields(nb: pynetbox.api, dry_run: bool = False, verbose: bool 
                 print(f"  Warning: Could not create custom field '{field_name}': {e}", file=sys.stderr)
 
 
-def get_or_create_site(nb: pynetbox.api, site_name: str, dry_run: bool = False) -> Optional[Any]:
+def get_or_create_site(nb: pynetbox.api, site_name: str, dry_run: bool = False) -> Any | None:
     """Get or create a site."""
     site = nb.dcim.sites.get(name=site_name)
     if site:
@@ -678,12 +769,7 @@ def get_or_create_site(nb: pynetbox.api, site_name: str, dry_run: bool = False) 
     return nb.dcim.sites.create(name=site_name, slug=slug)
 
 
-def get_or_create_location(
-    nb: pynetbox.api,
-    location_name: str,
-    site: Any,
-    dry_run: bool = False
-) -> Optional[Any]:
+def get_or_create_location(nb: pynetbox.api, location_name: str, site: Any, dry_run: bool = False) -> Any | None:
     """Get or create a location within a site."""
     if not location_name:
         return None
@@ -708,11 +794,11 @@ def sync_power_panel(
     nb: pynetbox.api,
     panel_data: PanelData,
     site: Any,
-    location: Optional[Any],
+    location: Any | None,
     dry_run: bool = False,
     verbose: bool = False,
-) -> Optional[Any]:
-    """Create or update a power panel in NetBox."""
+) -> tuple[Any | None, bool]:
+    """Create or update a power panel in NetBox; returns (panel, created)."""
     # Look for existing panel by serial number
     existing = None
     for pp in nb.dcim.power_panels.filter(site_id=site.id):
@@ -735,16 +821,16 @@ def sync_power_panel(
 
         if dry_run:
             print(f"  Would update power panel: {existing.name}")
-            return existing
+            return existing, False
 
         # Don't rename existing panels - only update custom fields
         existing.custom_fields = {**existing.custom_fields, **custom_field_data}
         existing.save()
-        return existing
+        return existing, False
     else:
         if dry_run:
             print(f"  Would create power panel: {panel_name}")
-            return None
+            return None, True
 
         if verbose:
             print(f"  Creating power panel: {panel_name}", file=sys.stderr)
@@ -757,7 +843,7 @@ def sync_power_panel(
         if location:
             pp_data["location"] = location.id
 
-        return nb.dcim.power_panels.create(pp_data)
+        return nb.dcim.power_panels.create(pp_data), True
 
 
 def sync_power_feeds(
@@ -793,15 +879,13 @@ def sync_power_feeds(
             feed = existing_feeds[circuit_id]
 
             # Check if update needed (ignore amperage if circuit has 0 rating)
-            amperage_changed = (
-                circuit.breaker_rating > 0 and
-                feed.amperage != circuit.breaker_rating
-            )
+            amperage_changed = circuit.breaker_rating > 0 and feed.amperage != circuit.breaker_rating
             needs_update = (
-                feed.name != feed_name or
-                amperage_changed or
-                feed.custom_fields.get("panel_space") != circuit.space or
-                feed.custom_fields.get("is_duplex") != circuit.is_duplex
+                feed.name != feed_name
+                or amperage_changed
+                or feed.voltage != circuit.voltage
+                or feed.custom_fields.get("panel_space") != circuit.space
+                or feed.custom_fields.get("is_duplex") != circuit.is_duplex
             )
 
             if needs_update:
@@ -814,6 +898,7 @@ def sync_power_feeds(
                     # Only update amperage if we have a valid value (NetBox requires >= 1)
                     if circuit.breaker_rating > 0:
                         feed.amperage = circuit.breaker_rating
+                    feed.voltage = circuit.voltage
                     feed.custom_fields = {**feed.custom_fields, **custom_field_data}
                     feed.save()
                 results["updated"] += 1
@@ -830,7 +915,7 @@ def sync_power_feeds(
                     "name": feed_name,
                     "power_panel": power_panel.id,
                     "amperage": circuit.breaker_rating if circuit.breaker_rating > 0 else 1,
-                    "voltage": 120,  # Default US voltage
+                    "voltage": circuit.voltage,
                     "phase": "single-phase",
                     "type": "primary",
                     "status": "active",
@@ -842,11 +927,30 @@ def sync_power_feeds(
     return results
 
 
+def usable_collection(collector: SpanMqttCollector) -> bool:
+    """Guard NetBox from defaults left by a failed or partial collection.
+
+    Returns False when the panel's own values were not all received. Otherwise
+    drops each circuit that is missing a required value and returns True.
+    """
+    panel_data = collector.panel_data
+    if not collector.connected:
+        print("  Error: could not connect to the panel's MQTT broker; skipping", file=sys.stderr)
+        return False
+    if not collector.panel_complete:
+        print("  Error: panel data incomplete (requires firmware r202633 or later); skipping", file=sys.stderr)
+        return False
+    for cid in [cid for cid, c in panel_data.circuits.items() if not c.complete]:
+        print(f"  Warning: circuit {cid} incomplete; skipping", file=sys.stderr)
+        del panel_data.circuits[cid]
+    return True
+
+
 def discover_panels_wrapper(timeout: float = 3.0) -> list[dict]:
     """Discover SPAN panels using span-discover."""
     import subprocess
 
-    discover_script = script_dir.parent.parent / "scripts" / "span-discover"
+    discover_script = span_api_dir / "scripts" / "span-discover"
     if not discover_script.exists():
         print(f"Warning: span-discover not found at {discover_script}", file=sys.stderr)
         return []
@@ -856,7 +960,8 @@ def discover_panels_wrapper(timeout: float = 3.0) -> list[dict]:
             [str(discover_script), "-j", "-t", str(int(timeout))],
             capture_output=True,
             text=True,
-            timeout=timeout + 30
+            timeout=timeout + 30,
+            check=False,
         )
 
         if result.returncode != 0:
@@ -864,7 +969,7 @@ def discover_panels_wrapper(timeout: float = 3.0) -> list[dict]:
 
         return json.loads(result.stdout)
 
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         print(f"Warning: Discovery failed: {e}", file=sys.stderr)
         return []
 
@@ -880,6 +985,7 @@ Environment Variables:
   NETBOX_SITE       Site name for panels (required)
   NETBOX_LOCATION   Optional location within site
   SPAN_AUTH_FILE    Override credential file path (default: ~/.span-auth.json)
+  SPAN_API_DIR      SPAN-API-Client-Docs checkout (default: two directories above this script)
 
 Examples:
   # Import all configured panels
@@ -896,42 +1002,19 @@ Examples:
         """,
     )
 
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes")
+    parser.add_argument("--panel", action="append", metavar="SERIAL", help="Import specific panel (can be repeated)")
+    parser.add_argument("--all-panels", action="store_true", help="Import all configured panels")
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes"
+        "--discover", action="store_true", help="Discover panels on network (requires credentials to be configured)"
     )
     parser.add_argument(
-        "--panel",
-        action="append",
-        metavar="SERIAL",
-        help="Import specific panel (can be repeated)"
+        "--create-devices", action="store_true", help="Also create device objects for panels with interfaces and IPs"
     )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument(
-        "--all-panels",
-        action="store_true",
-        help="Import all configured panels"
-    )
-    parser.add_argument(
-        "--discover",
-        action="store_true",
-        help="Discover panels on network (requires credentials to be configured)"
-    )
-    parser.add_argument(
-        "--create-devices",
-        action="store_true",
-        help="Also create device objects for panels with interfaces and IPs"
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Verbose output"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="MQTT data collection timeout in seconds (default: 10)"
+        "--timeout", type=float, default=10.0, help="MQTT data collection timeout in seconds (default: 10)"
     )
 
     args = parser.parse_args()
@@ -940,19 +1023,24 @@ Examples:
     try:
         import paho.mqtt.client as mqtt
         import pynetbox
-        from span_auth_utils import (
-            get_panel_credentials,
-            list_panels,
-            ensure_ca_cert,
-            load_auth_file,
-        )
+        import requests
     except ImportError as e:
         print(f"Error: Missing dependency: {e}", file=sys.stderr)
         print("Install dependencies with: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
+    try:
+        from span_auth_utils import (
+            ensure_ca_cert,
+            get_panel_credentials,
+            list_panels,
+        )
+    except ImportError as e:
+        print(f"Error: {e} (looked in {lib_dir})", file=sys.stderr)
+        print("Set SPAN_API_DIR to a SPAN-API-Client-Docs checkout", file=sys.stderr)
+        sys.exit(1)
 
-    # Make mqtt available to SpanMqttCollector class
-    globals()["mqtt"] = mqtt
+    # Bind the deferred imports for the module-level code that uses them
+    globals().update(mqtt=mqtt, pynetbox=pynetbox)
 
     # Validate environment
     netbox_url = os.environ.get("NETBOX_URL")
@@ -1006,7 +1094,7 @@ Examples:
     print("Checking custom fields...", file=sys.stderr)
     try:
         ensure_custom_fields(nb, dry_run=args.dry_run, verbose=args.verbose)
-    except Exception as e:
+    except (pynetbox.RequestError, pynetbox.ContentError, requests.RequestException) as e:
         print(f"Error: Could not connect to NetBox at {netbox_url}: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -1021,7 +1109,7 @@ Examples:
         location = get_or_create_location(nb, netbox_location, site, dry_run=args.dry_run)
 
     # Set up device prerequisites if --create-devices
-    # Note: device_type is created per-panel based on model from mDNS
+    # Note: device_type is created per-panel based on the panel model
     manufacturer = None
     device_role = None
     if args.create_devices:
@@ -1062,13 +1150,13 @@ Examples:
         # Ensure CA cert
         try:
             ca_cert_path = ensure_ca_cert(serial, hostname)
-        except Exception as e:
+        except (OSError, requests.RequestException) as e:
             print(f"  Error getting CA cert: {e}", file=sys.stderr)
             summary["errors"] += 1
             continue
 
         # Collect data via MQTT
-        print(f"  Collecting data via MQTT...", file=sys.stderr)
+        print("  Collecting data via MQTT...", file=sys.stderr)
         collector = SpanMqttCollector(
             serial_number=serial,
             hostname=hostname,
@@ -1080,28 +1168,29 @@ Examples:
         panel_data = collector.collect()
 
         if args.verbose:
+            print(f"  Data model version: {panel_data.data_model_version}", file=sys.stderr)
             print(f"  Hardware version: {panel_data.hardware_version}", file=sys.stderr)
             print(f"  Main breaker: {panel_data.main_breaker_rating}A", file=sys.stderr)
             print(f"  Circuits found: {len(panel_data.circuits)}", file=sys.stderr)
 
-        # Sync to NetBox
-        if not args.dry_run and not site:
-            print(f"  Skipping NetBox sync (site not available)", file=sys.stderr)
+        if not usable_collection(collector):
+            summary["errors"] += 1
             continue
 
-        power_panel = sync_power_panel(
-            nb, panel_data, site, location,
-            dry_run=args.dry_run, verbose=args.verbose
+        # Sync to NetBox
+        if not args.dry_run and not site:
+            print("  Skipping NetBox sync (site not available)", file=sys.stderr)
+            continue
+
+        power_panel, panel_created = sync_power_panel(
+            nb, panel_data, site, location, dry_run=args.dry_run, verbose=args.verbose
         )
 
-        if power_panel:
-            summary["panels_updated" if hasattr(power_panel, "id") else "panels_created"] += 1
+        if power_panel and not args.dry_run:
+            summary["panels_created" if panel_created else "panels_updated"] += 1
 
         # Sync circuits as power feeds
-        feed_results = sync_power_feeds(
-            nb, panel_data, power_panel,
-            dry_run=args.dry_run, verbose=args.verbose
-        )
+        feed_results = sync_power_feeds(nb, panel_data, power_panel, dry_run=args.dry_run, verbose=args.verbose)
         summary["feeds_created"] += feed_results.get("created", 0)
         summary["feeds_updated"] += feed_results.get("updated", 0)
 
@@ -1109,10 +1198,10 @@ Examples:
         if args.create_devices:
             # Query mDNS for device info (MAC addresses, IPs)
             if args.verbose:
-                print(f"  Querying mDNS for device info...", file=sys.stderr)
+                print("  Querying mDNS for device info...", file=sys.stderr)
             device_info = query_device_info_mdns(serial, timeout=3.0)
-            panel_data.model = device_info.get("model", "")
-            panel_data.firmware_version = device_info.get("firmware_version", "")
+            panel_data.model = panel_data.model or device_info.get("model", "")
+            panel_data.firmware_version = panel_data.firmware_version or device_info.get("firmware_version", "")
             panel_data.eth0_mac = device_info.get("eth0_mac", "")
             panel_data.eth1_mac = device_info.get("eth1_mac", "")
             panel_data.wlan0_mac = device_info.get("wlan0_mac", "")
@@ -1133,28 +1222,21 @@ Examples:
                 if panel_data.ip_addresses:
                     print(f"  IP addresses: {', '.join(panel_data.ip_addresses)}", file=sys.stderr)
 
-            # Create device type based on model from mDNS (e.g., "SPAN32")
-            device_type_name = panel_data.model if panel_data.model else "SPAN Panel"
+            # Device type from the panel model (e.g., "MAIN_32" -> "MAIN 32")
+            device_type_name = panel_data.model.replace("_", " ") if panel_data.model else "SPAN Panel"
             device_type = ensure_device_type(
-                nb, manufacturer, device_type_name,
-                dry_run=args.dry_run, verbose=args.verbose
+                nb, manufacturer, device_type_name, dry_run=args.dry_run, verbose=args.verbose
             )
 
+            device_existed = nb.dcim.devices.get(serial=panel_data.serial_number) is not None
             device = sync_device(
-                nb, panel_data, site, location, device_type, device_role,
-                dry_run=args.dry_run, verbose=args.verbose
+                nb, panel_data, site, location, device_type, device_role, dry_run=args.dry_run, verbose=args.verbose
             )
-            if device:
-                if nb.dcim.devices.get(serial=panel_data.serial_number):
-                    summary["devices_updated"] += 1
-                else:
-                    summary["devices_created"] += 1
+            if device and not args.dry_run:
+                summary["devices_updated" if device_existed else "devices_created"] += 1
 
                 # Link device to power panel
-                link_device_to_power_panel(
-                    nb, power_panel, device,
-                    dry_run=args.dry_run, verbose=args.verbose
-                )
+                link_device_to_power_panel(nb, power_panel, device, dry_run=args.dry_run, verbose=args.verbose)
 
         summary["panels_processed"] += 1
 
